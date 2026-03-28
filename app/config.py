@@ -33,8 +33,6 @@ def _parse_admin_ids(raw: str) -> set[int]:
 @dataclass(frozen=True)
 class Config:
     bot_token: str
-    tg_api_id: int
-    tg_api_hash: str
     openai_api_key: str
     openai_model: str
     timezone: str
@@ -48,8 +46,6 @@ class Config:
 def load_config() -> Config:
     return Config(
         bot_token=_get_env("TELEGRAM_BOT_TOKEN"),
-        tg_api_id=_parse_int(_get_env("TG_API_ID"), "TG_API_ID"),
-        tg_api_hash=_get_env("TG_API_HASH"),
         openai_api_key=_get_env("OPENAI_API_KEY"),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
         timezone=os.getenv("TIMEZONE", "Europe/Moscow"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -13,8 +14,7 @@ from aiogram.types import Message, CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import load_config, Config
-from .db import Database, MessageRow
-from .fetcher import HistoryFetcher
+from .db import Database
 from .summarizer import Summarizer, DigestItem
 from .keyboards import (
     kb_main, kb_channels, kb_keywords, kb_schedule,
@@ -27,7 +27,6 @@ from .keyboards import (
 cfg: Config | None = None
 db: Database | None = None
 summarizer: Summarizer | None = None
-fetcher: HistoryFetcher | None = None
 tz: ZoneInfo | None = None
 digest_lock = asyncio.Lock()
 _fired_slots: set[str] = set()
@@ -50,6 +49,24 @@ def _is_admin(user_id: int) -> bool:
     return cfg is not None and user_id in cfg.admin_ids
 
 
+def _normalize(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def _snippet(text: str, max_chars: int) -> str:
+    if not text:
+        return ""
+    for sep in (".", "!", "?"):
+        idx = text.find(sep)
+        if 0 < idx < max_chars:
+            return text[: idx + 1]
+    return text[:max_chars]
+
+
+def _make_hash(text: str) -> str:
+    return hashlib.sha256(text.lower().encode()).hexdigest()
+
+
 def _extract_forwarded_chat(message: Message):
     if message.forward_from_chat:
         return message.forward_from_chat
@@ -64,13 +81,50 @@ def _channel_label(ch) -> str:
         return f"@{ch.username}"
     if hasattr(ch, "title") and ch.title:
         return ch.title
-    return str(getattr(ch, "chat_id", ch.id))
+    return str(getattr(ch, "chat_id", getattr(ch, "id", "?")))
+
+
+# ─── incoming channel posts ───────────────────────────────────────────────────
+
+@router.channel_post()
+async def on_channel_post(message: Message) -> None:
+    """Store posts from registered channels as they arrive."""
+    assert db is not None and cfg is not None
+
+    ch = await db.get_channel_by_chat_id(message.chat.id)
+    if not ch:
+        return
+
+    content = message.text or message.caption
+    if not content:
+        return
+
+    text = _normalize(content)
+    if not text:
+        return
+
+    snippet = _snippet(text, cfg.snippet_chars)
+    msg_hash = _make_hash(text)
+    username = message.chat.username
+    link = f"https://t.me/{username}/{message.message_id}" if username else None
+    ts = int(message.date.replace(tzinfo=timezone.utc).timestamp()) if message.date.tzinfo is None else int(message.date.timestamp())
+
+    await db.add_message(
+        channel_id=ch.id,
+        chat_id=ch.chat_id,
+        message_id=message.message_id,
+        ts=ts,
+        text=text,
+        snippet=snippet,
+        link=link,
+        msg_hash=msg_hash,
+    )
 
 
 # ─── digest logic ─────────────────────────────────────────────────────────────
 
 async def _run_digest(bot: Bot) -> str:
-    assert db is not None and cfg is not None and summarizer is not None and fetcher is not None and tz is not None
+    assert db is not None and cfg is not None and summarizer is not None and tz is not None
 
     output_raw = await db.get_setting("output_chat_id")
     if not output_raw:
@@ -85,9 +139,6 @@ async def _run_digest(bot: Bot) -> str:
 
     last_ts_str = await db.get_setting("last_digest_ts")
     since_ts = int(last_ts_str) if last_ts_str else None
-    fetch_limit = 50 if since_ts else cfg.history_limit
-
-    await fetcher.fetch_all_channels(db, since_ts=since_ts, limit=fetch_limit)
 
     if since_ts:
         messages = await db.fetch_messages_since(since_ts, now_ts)
@@ -134,13 +185,11 @@ async def _digest_tick(bot: Bot) -> None:
 
     now = datetime.now(tz)
     slot = now.strftime("%Y-%m-%d %H:%M")
-
     if slot in _fired_slots:
         return
 
     schedule = await db.list_schedule()
-    current_time = now.strftime("%H:%M")
-    if current_time not in [t for _, t in schedule]:
+    if now.strftime("%H:%M") not in [t for _, t in schedule]:
         return
 
     _fired_slots.add(slot)
@@ -169,7 +218,10 @@ async def _show_channels(target: Message | CallbackQuery) -> None:
     channels = await db.list_channels()
     if channels:
         lines = "\n".join(f"• {_channel_label(ch)}" for ch in channels)
-        text = f"📢 *Каналы* ({len(channels)}):\n\n{lines}"
+        text = (
+            f"📢 *Каналы* ({len(channels)}):\n\n{lines}\n\n"
+            "_Добавь бота как администратора в каждый канал, чтобы он получал посты._"
+        )
     else:
         text = "📢 *Каналы*\n\n_Пока нет ни одного канала._"
     if isinstance(target, CallbackQuery):
@@ -253,7 +305,8 @@ async def cb_ch_add(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.add_channel)
     await cq.message.edit_text(
         "📢 *Добавить канал*\n\n"
-        "Перешли любой пост из канала\nили введи @username / числовой ID:",
+        "Перешли любой пост из канала\nили введи @username / числовой ID:\n\n"
+        "_После добавления не забудь назначить бота администратором канала._",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
     )
@@ -271,13 +324,11 @@ async def cb_ch_del(cq: CallbackQuery) -> None:
     await _show_channels(cq)
 
 
-# ─── FSM: add channel ─────────────────────────────────────────────────────────
-
 @router.message(S.add_channel)
-async def fsm_add_channel(message: Message, state: FSMContext) -> None:
+async def fsm_add_channel(message: Message, state: FSMContext, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
-    assert db is not None and fetcher is not None and cfg is not None
+    assert db is not None
 
     chat = _extract_forwarded_chat(message)
 
@@ -295,40 +346,38 @@ async def fsm_add_channel(message: Message, state: FSMContext) -> None:
         await state.clear()
         label = f"@{chat.username}" if chat.username else chat.title
         await message.answer(
-            f"✅ Канал *{label}* добавлен!",
+            f"✅ Канал *{label}* добавлен!\n\nНазначь бота администратором канала, чтобы он получал посты.",
             parse_mode="Markdown",
             reply_markup=kb_back(),
         )
         return
 
-    raw = message.text.strip() if message.text else ""
+    raw = (message.text or "").strip()
     if not raw:
         await message.answer("Перешли пост из канала или введи @username.", reply_markup=kb_cancel())
         return
 
     identifier = raw.lstrip("@")
-    info = await fetcher.resolve_channel(identifier)
-    if not info:
+    try:
+        chat_obj = await bot.get_chat(int(identifier) if identifier.lstrip("-").isdigit() else f"@{identifier}")
+    except Exception:
         await message.answer(
-            "❌ Канал не найден. Попробуй ещё раз или нажми Отмена.",
+            "❌ Канал не найден. Убедись, что канал публичный, и попробуй ещё раз.",
             reply_markup=kb_cancel(),
         )
         return
 
-    existing = await db.get_channel_by_chat_id(info.chat_id)
+    existing = await db.get_channel_by_chat_id(chat_obj.id)
     if existing:
         await state.clear()
-        await message.answer(
-            f"ℹ️ Канал уже добавлен.",
-            reply_markup=kb_back(),
-        )
+        await message.answer("ℹ️ Канал уже добавлен.", reply_markup=kb_back())
         return
 
-    await db.add_channel(chat_id=info.chat_id, username=info.username, title=info.title)
+    await db.add_channel(chat_id=chat_obj.id, username=chat_obj.username, title=chat_obj.title)
     await state.clear()
-    label = f"@{info.username}" if info.username else info.title
+    label = f"@{chat_obj.username}" if chat_obj.username else chat_obj.title
     await message.answer(
-        f"✅ Канал *{label}* добавлен!",
+        f"✅ Канал *{label}* добавлен!\n\nНазначь бота администратором канала, чтобы он получал посты.",
         parse_mode="Markdown",
         reply_markup=kb_back(),
     )
@@ -458,10 +507,7 @@ async def cb_out_show(cq: CallbackQuery) -> None:
     assert db is not None
     await cq.answer()
     current = await db.get_setting("output_chat_id")
-    if current:
-        text = f"📤 *Куда слать дайджест*\n\nТекущий chat ID: `{current}`"
-    else:
-        text = "📤 *Куда слать дайджест*\n\n_Не задан._"
+    text = f"📤 *Куда слать дайджест*\n\nТекущий chat ID: `{current}`" if current else "📤 *Куда слать дайджест*\n\n_Не задан._"
     await cq.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_output(current))
 
 
@@ -475,28 +521,24 @@ async def cb_out_set(cq: CallbackQuery, state: FSMContext) -> None:
     await cq.message.edit_text(
         "📤 *Задать output-чат*\n\n"
         "Перешли любое сообщение из целевого канала/чата\n"
-        "или введи @username / числовой ID:",
+        "или введи @username / числовой ID чата:",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
     )
 
 
 @router.message(S.set_output)
-async def fsm_set_output(message: Message, state: FSMContext) -> None:
+async def fsm_set_output(message: Message, state: FSMContext, bot: Bot) -> None:
     if not _is_admin(message.from_user.id):
         return
-    assert db is not None and fetcher is not None
+    assert db is not None
 
     chat = _extract_forwarded_chat(message)
     if chat:
         await db.set_setting("output_chat_id", str(chat.id))
         await state.clear()
         label = f"@{chat.username}" if chat.username else chat.title
-        await message.answer(
-            f"✅ Output-чат установлен: *{label}*",
-            parse_mode="Markdown",
-            reply_markup=kb_back(),
-        )
+        await message.answer(f"✅ Output-чат: *{label}*", parse_mode="Markdown", reply_markup=kb_back())
         return
 
     raw = (message.text or "").strip()
@@ -506,24 +548,21 @@ async def fsm_set_output(message: Message, state: FSMContext) -> None:
 
     identifier = raw.lstrip("@")
     if identifier.lstrip("-").isdigit():
-        await db.set_setting("output_chat_id", identifier if identifier.startswith("-") else raw)
+        await db.set_setting("output_chat_id", raw if raw.startswith("-") else identifier)
         await state.clear()
-        await message.answer(f"✅ Output-чат установлен: `{raw}`", parse_mode="Markdown", reply_markup=kb_back())
+        await message.answer(f"✅ Output-чат: `{raw}`", parse_mode="Markdown", reply_markup=kb_back())
         return
 
-    info = await fetcher.resolve_channel(identifier)
-    if not info:
+    try:
+        chat_obj = await bot.get_chat(f"@{identifier}")
+    except Exception:
         await message.answer("❌ Чат не найден. Попробуй ещё раз или нажми Отмена.", reply_markup=kb_cancel())
         return
 
-    await db.set_setting("output_chat_id", str(info.chat_id))
+    await db.set_setting("output_chat_id", str(chat_obj.id))
     await state.clear()
-    label = f"@{info.username}" if info.username else info.title
-    await message.answer(
-        f"✅ Output-чат установлен: *{label}*",
-        parse_mode="Markdown",
-        reply_markup=kb_back(),
-    )
+    label = f"@{chat_obj.username}" if chat_obj.username else chat_obj.title
+    await message.answer(f"✅ Output-чат: *{label}*", parse_mode="Markdown", reply_markup=kb_back())
 
 
 # ─── Callbacks: digest & status ───────────────────────────────────────────────
@@ -533,8 +572,8 @@ async def cb_digest_now(cq: CallbackQuery, bot: Bot) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
-    await cq.answer("⏳ Запускаю...", show_alert=False)
-    await cq.message.edit_text("⏳ Генерирую дайджест...", reply_markup=kb_cancel())
+    await cq.answer("⏳ Запускаю...")
+    await cq.message.edit_text("⏳ Генерирую дайджест...", reply_markup=None)
     async with digest_lock:
         result = await _run_digest(bot)
     await cq.message.edit_text(result, reply_markup=kb_back())
@@ -580,7 +619,7 @@ async def cb_status(cq: CallbackQuery) -> None:
 # ─── entry point ─────────────────────────────────────────────────────────────
 
 async def main() -> None:
-    global cfg, db, summarizer, fetcher, tz
+    global cfg, db, summarizer, tz
 
     cfg = load_config()
     tz = ZoneInfo(cfg.timezone)
@@ -588,8 +627,6 @@ async def main() -> None:
     await db.connect()
 
     summarizer = Summarizer(api_key=cfg.openai_api_key, model=cfg.openai_model)
-    fetcher = HistoryFetcher(cfg)
-    await fetcher.start()
 
     bot = Bot(token=cfg.bot_token)
     dp = Dispatcher()
@@ -603,7 +640,6 @@ async def main() -> None:
         await dp.start_polling(bot)
     finally:
         scheduler.shutdown()
-        await fetcher.stop()
         await db.close()
         await bot.session.close()
 
