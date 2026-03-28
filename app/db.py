@@ -57,6 +57,7 @@ class Database:
         async with self._conn.execute("PRAGMA foreign_keys=ON"):
             pass
         await self._init_schema()
+        await self._migrate()
 
     async def close(self) -> None:
         if self._conn:
@@ -115,10 +116,14 @@ class Database:
             end_ts INTEGER NOT NULL,
             status TEXT NOT NULL,
             error TEXT,
+            tokens_in INTEGER DEFAULT 0,
+            tokens_out INTEGER DEFAULT 0,
             UNIQUE(topic_id, window_id, end_ts),
-            FOREIGN KEY(topic_id) REFERENCES topics(id) ON DELETE CASCADE,
-            FOREIGN KEY(window_id) REFERENCES windows(id) ON DELETE CASCADE
+            FOREIGN KEY(topic_id) REFERENCES topics(id) ON DELETE CASCADE
         );
+        -- window_id=0 is reserved for emergency digests (no FK constraint)
+        -- migration: add token columns if not present
+        CREATE TABLE IF NOT EXISTS _migrations(name TEXT PRIMARY KEY);
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -127,6 +132,19 @@ class Database:
         async with self._lock:
             await self._conn.executescript(schema)
             await self._conn.commit()
+
+    async def _migrate(self) -> None:
+        """Apply one-time schema migrations for existing databases."""
+        assert self._conn is not None
+        async with self._lock:
+            for col in ("tokens_in", "tokens_out"):
+                try:
+                    await self._conn.execute(
+                        f"ALTER TABLE digests ADD COLUMN {col} INTEGER DEFAULT 0"
+                    )
+                    await self._conn.commit()
+                except Exception:
+                    pass  # column already exists
 
     async def _execute(self, query: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
         assert self._conn is not None
@@ -159,8 +177,16 @@ class Database:
         cur = await self._execute("UPDATE topics SET name = ? WHERE name = ?", (new, old))
         return cur.rowcount > 0
 
+    async def rename_topic_by_id(self, topic_id: int, new_name: str) -> bool:
+        cur = await self._execute("UPDATE topics SET name = ? WHERE id = ?", (new_name, topic_id))
+        return cur.rowcount > 0
+
     async def remove_topic(self, name: str) -> bool:
         cur = await self._execute("DELETE FROM topics WHERE name = ?", (name,))
+        return cur.rowcount > 0
+
+    async def remove_topic_by_id(self, topic_id: int) -> bool:
+        cur = await self._execute("DELETE FROM topics WHERE id = ?", (topic_id,))
         return cur.rowcount > 0
 
     async def list_topics(self) -> list[Topic]:
@@ -169,6 +195,12 @@ class Database:
 
     async def get_topic(self, name: str) -> Topic | None:
         row = await self._fetchone("SELECT id, name FROM topics WHERE name = ?", (name,))
+        if row:
+            return Topic(id=row["id"], name=row["name"])
+        return None
+
+    async def get_topic_by_id(self, topic_id: int) -> Topic | None:
+        row = await self._fetchone("SELECT id, name FROM topics WHERE id = ?", (topic_id,))
         if row:
             return Topic(id=row["id"], name=row["name"])
         return None
@@ -325,6 +357,38 @@ class Database:
             for row in rows
         ]
 
+    async def fetch_recent_messages_for_topic(self, topic_id: int, limit: int = 30) -> list[MessageRow]:
+        rows = await self._fetchall(
+            """
+            SELECT m.id, m.source_id, m.chat_id, m.message_id, m.ts, m.text, m.snippet, m.link, m.hash,
+                   s.username AS source_username, s.title AS source_title
+            FROM messages m
+            JOIN sources s ON s.id = m.source_id
+            JOIN topic_sources ts ON ts.source_id = s.id
+            WHERE ts.topic_id = ?
+            ORDER BY m.ts DESC
+            LIMIT ?
+            """,
+            (topic_id, limit),
+        )
+        return [
+            MessageRow(
+                id=row["id"], source_id=row["source_id"], chat_id=row["chat_id"],
+                message_id=row["message_id"], ts=row["ts"], text=row["text"],
+                snippet=row["snippet"], link=row["link"], hash=row["hash"],
+                source_username=row["source_username"], source_title=row["source_title"],
+            )
+            for row in rows
+        ]
+
+    async def is_first_digest(self, topic_id: int) -> bool:
+        """True if this topic has never had a real digest sent (seeded-only doesn't count)."""
+        row = await self._fetchone(
+            "SELECT id FROM digests WHERE topic_id = ? AND status IN ('sent', 'empty') LIMIT 1",
+            (topic_id,),
+        )
+        return row is None
+
     async def create_digest(self, topic_id: int, window_id: int, end_ts: int) -> bool:
         cur = await self._execute(
             "INSERT OR IGNORE INTO digests(topic_id, window_id, end_ts, status) VALUES (?, ?, ?, ?)",
@@ -332,11 +396,51 @@ class Database:
         )
         return cur.rowcount > 0
 
-    async def finish_digest(self, topic_id: int, window_id: int, end_ts: int, status: str, error: str | None) -> None:
+    async def finish_digest(
+        self,
+        topic_id: int,
+        window_id: int,
+        end_ts: int,
+        status: str,
+        error: str | None,
+        tokens_in: int = 0,
+        tokens_out: int = 0,
+    ) -> None:
         await self._execute(
-            "UPDATE digests SET status = ?, error = ? WHERE topic_id = ? AND window_id = ? AND end_ts = ?",
-            (status, error, topic_id, window_id, end_ts),
+            """UPDATE digests SET status = ?, error = ?, tokens_in = ?, tokens_out = ?
+               WHERE topic_id = ? AND window_id = ? AND end_ts = ?""",
+            (status, error, tokens_in, tokens_out, topic_id, window_id, end_ts),
         )
+
+    async def log_emergency_tokens(self, topic_id: int, tokens_in: int, tokens_out: int) -> None:
+        """Store token usage for an emergency digest (window_id=0, end_ts=now)."""
+        import time as _time
+        end_ts = int(_time.time())
+        await self._execute(
+            """INSERT OR IGNORE INTO digests(topic_id, window_id, end_ts, status, tokens_in, tokens_out)
+               VALUES (?, 0, ?, 'sent', ?, ?)""",
+            (topic_id, end_ts, tokens_in, tokens_out),
+        )
+
+    async def get_token_stats(self) -> dict:
+        """Returns total and per-topic token usage."""
+        row = await self._fetchone(
+            "SELECT SUM(tokens_in) as ti, SUM(tokens_out) as to_ FROM digests WHERE status = 'sent'"
+        )
+        total_in = row["ti"] or 0
+        total_out = row["to_"] or 0
+
+        rows = await self._fetchall(
+            """SELECT t.name, SUM(d.tokens_in) as ti, SUM(d.tokens_out) as to_, COUNT(*) as cnt
+               FROM digests d JOIN topics t ON t.id = d.topic_id
+               WHERE d.status = 'sent'
+               GROUP BY d.topic_id ORDER BY ti DESC"""
+        )
+        per_topic = [
+            {"name": r["name"], "tokens_in": r["ti"] or 0, "tokens_out": r["to_"] or 0, "count": r["cnt"]}
+            for r in rows
+        ]
+        return {"total_in": total_in, "total_out": total_out, "per_topic": per_topic}
 
     async def set_setting(self, key: str, value: str) -> None:
         await self._execute(
