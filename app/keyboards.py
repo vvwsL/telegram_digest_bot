@@ -3,115 +3,73 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from .db import Topic, Source, WindowRow
-from .windows import format_days, DAY_NAMES_RU
+from .db import Channel
 
 
 def _btn(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
 
 
-def kb_main_menu() -> InlineKeyboardMarkup:
+def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(
-        _btn("📋 Темы", "menu:topics"),
-        _btn("⏰ Окна", "menu:windows"),
-    )
-    b.row(
-        _btn("📤 Задать output-чат", "action:setoutput"),
-        _btn("📊 Статус", "action:status"),
-    )
-    b.row(_btn("🚨 Экстренная сводка (30 постов)", "action:emergency_digest"))
+    b.row(_btn("📢 Каналы", "ch:list"), _btn("🔑 Ключевые слова", "kw:list"))
+    b.row(_btn("⏰ Расписание", "sch:list"), _btn("📤 Куда слать", "out:show"))
+    b.row(_btn("🚀 Дайджест сейчас", "digest:now"))
+    b.row(_btn("📊 Статус", "status:show"))
     return b.as_markup()
 
 
-def kb_topics(topics: list[Topic]) -> InlineKeyboardMarkup:
+def kb_channels(channels: list[Channel]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for t in topics:
-        b.row(_btn(f"📌 {t.name}", f"topic:show:{t.id}"))
-    b.row(_btn("➕ Новая тема", "action:add_topic"))
-    b.row(_btn("🔙 Главное меню", "menu:main"))
-    return b.as_markup()
-
-
-def kb_topic_detail(topic: Topic) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.row(
-        _btn("📡 Источники", f"topic:sources:{topic.id}"),
-        _btn("🔑 Ключевые слова", f"topic:keywords:{topic.id}"),
-    )
-    b.row(
-        _btn("✏️ Переименовать", f"topic:rename:{topic.id}"),
-        _btn("🗑️ Удалить тему", f"topic:del_confirm:{topic.id}"),
-    )
-    b.row(_btn("🔙 К темам", "menu:topics"))
-    return b.as_markup()
-
-
-def kb_topic_del_confirm(topic: Topic) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.row(
-        _btn("✅ Да, удалить", f"topic:del:{topic.id}"),
-        _btn("❌ Отмена", f"topic:show:{topic.id}"),
-    )
-    return b.as_markup()
-
-
-def kb_sources(topic: Topic, sources: list[Source]) -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    for s in sources:
-        label = f"@{s.username}" if s.username else (s.title or str(s.chat_id))
+    for ch in channels:
+        label = f"@{ch.username}" if ch.username else (ch.title or str(ch.chat_id))
         b.row(
-            InlineKeyboardButton(text=f"📡 {label}", callback_data=f"noop"),
-            _btn("🗑️", f"src:del:{topic.id}:{s.id}"),
+            InlineKeyboardButton(text=f"📢 {label[:35]}", callback_data="noop"),
+            _btn("🗑️", f"ch:del:{ch.id}"),
         )
-    b.row(_btn("➕ Добавить источник", f"topic:src_add:{topic.id}"))
-    b.row(_btn("🔙 К теме", f"topic:show:{topic.id}"))
+    b.row(_btn("➕ Добавить канал", "ch:add"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
 
-def kb_keywords(topic: Topic, keywords: list[str]) -> InlineKeyboardMarkup:
+def kb_keywords(keywords: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for kw in keywords:
-        # Store index to avoid 64-byte callback limit on long keywords
-        safe = kw[:30]
+    for kw_id, kw in keywords:
         b.row(
-            InlineKeyboardButton(text=f"🔑 {kw}", callback_data="noop"),
-            _btn("🗑️", f"kw:del:{topic.id}:{safe}"),
+            InlineKeyboardButton(text=f"🔑 {kw[:35]}", callback_data="noop"),
+            _btn("🗑️", f"kw:del:{kw_id}"),
         )
-    b.row(_btn("➕ Добавить ключевое слово", f"topic:kw_add:{topic.id}"))
-    b.row(_btn("🔙 К теме", f"topic:show:{topic.id}"))
+    b.row(_btn("➕ Добавить слово", "kw:add"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
 
-def kb_windows(windows: list[WindowRow]) -> InlineKeyboardMarkup:
+def kb_schedule(times: list[tuple[int, str]]) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    for w in windows:
-        days = [int(x) for x in w.days.split(",") if x]
-        label = f"#{w.id} {format_days(days)} {w.start}–{w.end}"
+    for sch_id, t in times:
         b.row(
-            InlineKeyboardButton(text=f"⏰ {label}", callback_data="noop"),
-            _btn("🗑️", f"window:del:{w.id}"),
+            InlineKeyboardButton(text=f"⏰ {t}", callback_data="noop"),
+            _btn("🗑️", f"sch:del:{sch_id}"),
         )
-    b.row(_btn("➕ Новое окно", "action:add_window"))
-    b.row(_btn("🔙 Главное меню", "menu:main"))
+    b.row(_btn("➕ Добавить время", "sch:add"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
 
-def kb_cancel(back_cb: str = "menu:main") -> InlineKeyboardMarkup:
+def kb_output(current: str | None) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(_btn("❌ Отмена", back_cb))
+    b.row(_btn("✏️ Изменить", "out:set"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
 
-def kb_back(cb: str) -> InlineKeyboardMarkup:
+def kb_cancel() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(_btn("🔙 Назад", cb))
+    b.row(_btn("❌ Отмена", "main:menu"))
     return b.as_markup()
 
 
-def kb_status_detail() -> InlineKeyboardMarkup:
+def kb_back() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
-    b.row(_btn("🔢 Статистика токенов", "action:token_stats"))
-    b.row(_btn("🔙 Главное меню", "menu:main"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
