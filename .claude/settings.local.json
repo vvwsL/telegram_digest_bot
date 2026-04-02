@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(del:*)"
+      "Bash(del:*)",
+      "Bash(python -c ':*)"
     ]
   }
 }
