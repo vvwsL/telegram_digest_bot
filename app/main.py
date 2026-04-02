@@ -149,7 +149,7 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
-    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown")
+    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     await db.set_setting(last_key, str(now_ts))
 
@@ -216,7 +216,7 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
-    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown")
+    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
 
