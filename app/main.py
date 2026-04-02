@@ -221,15 +221,25 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
     return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
 
 
-async def _run_all_digests(bot: Bot) -> str:
+async def _run_all_digests(bot: Bot, progress_msg: Message | None = None) -> str:
     assert db is not None
 
     folders = await db.list_folders()
     if not folders:
         return "❌ Нет папок."
 
+    total = len(folders)
     lines = []
-    for folder in folders:
+    for i, folder in enumerate(folders, start=1):
+        if progress_msg:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ [{i}/{total}] Обрабатываю *{folder.name}*...",
+                    parse_mode="Markdown",
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
         result = await _run_folder_digest(bot, folder)
         lines.append(f"*{folder.name}*: {result}")
 
@@ -905,7 +915,7 @@ async def cb_digest_now(cq: CallbackQuery, bot: Bot) -> None:
     await cq.answer("⏳ Запускаю...")
     await cq.message.edit_text("⏳ Генерирую дайджесты всех папок...", reply_markup=None)
     async with digest_lock:
-        result = await _run_all_digests(bot)
+        result = await _run_all_digests(bot, progress_msg=cq.message)
     await cq.message.edit_text(result, parse_mode="Markdown", reply_markup=kb_back())
 
 
@@ -943,9 +953,15 @@ async def cb_oneoff_period(cq: CallbackQuery, bot: Bot) -> None:
         await cq.message.edit_text("❌ Нет папок.", reply_markup=kb_back())
         return
 
+    total = len(folders)
     lines = []
     async with digest_lock:
-        for folder in folders:
+        for i, folder in enumerate(folders, start=1):
+            await cq.message.edit_text(
+                f"⏳ [{i}/{total}] Обрабатываю *{folder.name}*...",
+                parse_mode="Markdown",
+                reply_markup=None,
+            )
             result = await _run_folder_digest_for_period(bot, folder, days)
             lines.append(f"*{folder.name}*: {result}")
 
