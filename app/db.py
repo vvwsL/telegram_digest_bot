@@ -7,11 +7,18 @@ import aiosqlite
 
 
 @dataclass(frozen=True)
+class Folder:
+    id: int
+    name: str
+
+
+@dataclass(frozen=True)
 class Channel:
     id: int
     chat_id: int
     username: str | None
     title: str | None
+    folder_id: int | None
 
 
 @dataclass(frozen=True)
@@ -51,12 +58,16 @@ class Database:
     async def _init_schema(self) -> None:
         assert self._conn is not None
         schema = """
+        CREATE TABLE IF NOT EXISTS folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE
+        );
         CREATE TABLE IF NOT EXISTS channels (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL UNIQUE,
             username TEXT,
             title TEXT,
-            scraper INTEGER NOT NULL DEFAULT 0
+            folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL
         );
         CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -96,15 +107,17 @@ class Database:
         async with self._lock:
             await self._conn.executescript(schema)
             await self._conn.commit()
-        # migration: add scraper column to existing databases
-        try:
-            async with self._lock:
-                await self._conn.execute(
-                    "ALTER TABLE channels ADD COLUMN scraper INTEGER NOT NULL DEFAULT 0"
-                )
-                await self._conn.commit()
-        except Exception:
-            pass  # column already exists
+
+        # migrations for existing databases
+        for migration in (
+            "ALTER TABLE channels ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL",
+        ):
+            try:
+                async with self._lock:
+                    await self._conn.execute(migration)
+                    await self._conn.commit()
+            except Exception:
+                pass
 
     async def _execute(self, query: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
         assert self._conn is not None
@@ -125,63 +138,89 @@ class Database:
             cur = await self._conn.execute(query, params)
             return await cur.fetchall()
 
-    # ── Channels ──────────────────────────────────────────────────────────────
+    # ── Folders ───────────────────────────────────────────────────────────────
 
-    async def add_channel(self, chat_id: int, username: str | None, title: str | None) -> int:
+    async def add_folder(self, name: str) -> tuple[int, bool]:
         cur = await self._execute(
-            "INSERT OR IGNORE INTO channels(chat_id, username, title) VALUES (?, ?, ?)",
-            (chat_id, username, title),
+            "INSERT OR IGNORE INTO folders(name) VALUES (?)", (name,)
         )
         if cur.rowcount == 0:
+            row = await self._fetchone("SELECT id FROM folders WHERE name = ?", (name,))
+            return (row["id"] if row else -1), False
+        return cur.lastrowid, True
+
+    async def remove_folder(self, folder_id: int) -> bool:
+        cur = await self._execute("DELETE FROM folders WHERE id = ?", (folder_id,))
+        return cur.rowcount > 0
+
+    async def list_folders(self) -> list[Folder]:
+        rows = await self._fetchall("SELECT id, name FROM folders ORDER BY name")
+        return [Folder(id=r["id"], name=r["name"]) for r in rows]
+
+    async def get_folder(self, folder_id: int) -> Folder | None:
+        row = await self._fetchone("SELECT id, name FROM folders WHERE id = ?", (folder_id,))
+        return Folder(id=row["id"], name=row["name"]) if row else None
+
+    async def count_channels_in_folder(self, folder_id: int) -> int:
+        row = await self._fetchone(
+            "SELECT COUNT(*) as cnt FROM channels WHERE folder_id = ?", (folder_id,)
+        )
+        return row["cnt"] if row else 0
+
+    # ── Channels ──────────────────────────────────────────────────────────────
+
+    async def add_scraper_channel(self, username: str, folder_id: int, title: str | None = None) -> tuple[int, bool]:
+        from .scraper import synthetic_chat_id
+        uname = username.lstrip("@").lower()
+        chat_id = synthetic_chat_id(uname)
+        cur = await self._execute(
+            "INSERT OR IGNORE INTO channels(chat_id, username, title, folder_id) VALUES (?, ?, ?, ?)",
+            (chat_id, uname, title, folder_id),
+        )
+        if cur.rowcount == 0:
+            # already exists — update folder
             row = await self._fetchone("SELECT id FROM channels WHERE chat_id = ?", (chat_id,))
-            return row["id"]
-        return cur.lastrowid
+            if row:
+                await self._execute(
+                    "UPDATE channels SET folder_id = ? WHERE id = ?", (folder_id, row["id"])
+                )
+                return row["id"], False
+            return -1, False
+        return cur.lastrowid, True
 
     async def remove_channel(self, channel_id: int) -> bool:
         cur = await self._execute("DELETE FROM channels WHERE id = ?", (channel_id,))
         return cur.rowcount > 0
 
-    async def list_channels(self) -> list[Channel]:
+    async def list_channels_in_folder(self, folder_id: int) -> list[Channel]:
         rows = await self._fetchall(
-            "SELECT id, chat_id, username, title FROM channels ORDER BY COALESCE(title, username, chat_id)"
+            "SELECT id, chat_id, username, title, folder_id FROM channels"
+            " WHERE folder_id = ? ORDER BY COALESCE(title, username, chat_id)",
+            (folder_id,),
         )
-        return [Channel(id=r["id"], chat_id=r["chat_id"], username=r["username"], title=r["title"]) for r in rows]
+        return [_ch_row(r) for r in rows]
+
+    async def list_all_channels(self) -> list[Channel]:
+        rows = await self._fetchall(
+            "SELECT id, chat_id, username, title, folder_id FROM channels"
+            " ORDER BY COALESCE(title, username, chat_id)"
+        )
+        return [_ch_row(r) for r in rows]
+
+    async def list_scraper_channels(self) -> list[Channel]:
+        """All channels (all are scraper-based now)."""
+        rows = await self._fetchall(
+            "SELECT id, chat_id, username, title, folder_id FROM channels"
+            " WHERE username IS NOT NULL"
+        )
+        return [_ch_row(r) for r in rows]
 
     async def get_channel_by_chat_id(self, chat_id: int) -> Channel | None:
         row = await self._fetchone(
-            "SELECT id, chat_id, username, title FROM channels WHERE chat_id = ?", (chat_id,)
+            "SELECT id, chat_id, username, title, folder_id FROM channels WHERE chat_id = ?",
+            (chat_id,),
         )
-        if not row:
-            return None
-        return Channel(id=row["id"], chat_id=row["chat_id"], username=row["username"], title=row["title"])
-
-    async def add_scraper_channel(self, username: str, title: str | None) -> tuple[int, bool]:
-        """
-        Register a channel for web-scraping via t.me/s/.
-        Returns (channel_id, created) — created=False if already existed.
-        Uses a synthetic chat_id so the UNIQUE constraint is satisfied.
-        """
-        from .scraper import synthetic_chat_id
-        uname = username.lstrip("@").lower()
-        chat_id = synthetic_chat_id(uname)
-        cur = await self._execute(
-            "INSERT OR IGNORE INTO channels(chat_id, username, title, scraper) VALUES (?, ?, ?, 1)",
-            (chat_id, uname, title),
-        )
-        if cur.rowcount == 0:
-            row = await self._fetchone(
-                "SELECT id FROM channels WHERE username = ? AND scraper = 1", (uname,)
-            )
-            return (row["id"] if row else -1), False
-        return cur.lastrowid, True
-
-    async def list_scraper_channels(self) -> list[Channel]:
-        """Return only channels tracked via the web scraper."""
-        rows = await self._fetchall(
-            "SELECT id, chat_id, username, title FROM channels"
-            " WHERE scraper = 1 AND username IS NOT NULL"
-        )
-        return [Channel(id=r["id"], chat_id=r["chat_id"], username=r["username"], title=r["title"]) for r in rows]
+        return _ch_row(row) if row else None
 
     # ── Schedule ──────────────────────────────────────────────────────────────
 
@@ -235,7 +274,9 @@ class Database:
         )
         return cur.rowcount > 0
 
-    async def fetch_messages_since(self, since_ts: int, until_ts: int) -> list[MessageRow]:
+    async def fetch_messages_since_by_folder(
+        self, folder_id: int, since_ts: int, until_ts: int
+    ) -> list[MessageRow]:
         rows = await self._fetchall(
             """
             SELECT m.id, m.channel_id, m.chat_id, m.message_id, m.ts,
@@ -243,14 +284,16 @@ class Database:
                    c.username AS channel_username, c.title AS channel_title
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
-            WHERE m.ts >= ? AND m.ts < ?
+            WHERE c.folder_id = ? AND m.ts >= ? AND m.ts < ?
             ORDER BY m.ts DESC
             """,
-            (since_ts, until_ts),
+            (folder_id, since_ts, until_ts),
         )
         return [_msg_row(r) for r in rows]
 
-    async def fetch_recent_messages(self, limit: int = 30) -> list[MessageRow]:
+    async def fetch_recent_messages_by_folder(
+        self, folder_id: int, limit: int = 30
+    ) -> list[MessageRow]:
         rows = await self._fetchall(
             """
             SELECT m.id, m.channel_id, m.chat_id, m.message_id, m.ts,
@@ -258,10 +301,11 @@ class Database:
                    c.username AS channel_username, c.title AS channel_title
             FROM messages m
             JOIN channels c ON c.id = m.channel_id
+            WHERE c.folder_id = ?
             ORDER BY m.ts DESC
             LIMIT ?
             """,
-            (limit,),
+            (folder_id, limit),
         )
         return [_msg_row(r) for r in rows]
 
@@ -296,6 +340,16 @@ class Database:
     async def get_setting(self, key: str) -> str | None:
         row = await self._fetchone("SELECT value FROM settings WHERE key = ?", (key,))
         return row["value"] if row else None
+
+
+def _ch_row(r: aiosqlite.Row) -> Channel:
+    return Channel(
+        id=r["id"],
+        chat_id=r["chat_id"],
+        username=r["username"],
+        title=r["title"],
+        folder_id=r["folder_id"],
+    )
 
 
 def _msg_row(r: aiosqlite.Row) -> MessageRow:

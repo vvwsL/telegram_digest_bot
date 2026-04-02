@@ -14,12 +14,13 @@ from aiogram.types import Message, CallbackQuery
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import load_config, Config
-from .db import Database
+from .db import Database, Folder
 from .scraper import fetch_channel_posts
 from .summarizer import Summarizer, DigestItem
 from .keyboards import (
-    kb_main, kb_channels, kb_keywords, kb_schedule,
-    kb_output, kb_cancel, kb_back,
+    kb_main, kb_folders, kb_folder,
+    kb_keywords, kb_schedule, kb_output,
+    kb_cancel, kb_back, kb_back_to_folders, kb_back_to_folder,
 )
 
 
@@ -38,11 +39,11 @@ router = Router()
 # ─── FSM states ──────────────────────────────────────────────────────────────
 
 class S(StatesGroup):
-    add_channel        = State()
-    add_scraper_channel = State()
-    add_keyword        = State()
-    add_schedule       = State()
-    set_output         = State()
+    add_folder          = State()
+    add_channel_in_folder = State()   # data: folder_id
+    add_keyword         = State()
+    add_schedule        = State()
+    set_output          = State()
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -69,86 +70,33 @@ def _make_hash(text: str) -> str:
     return hashlib.sha256(text.lower().encode()).hexdigest()
 
 
-def _extract_forwarded_chat(message: Message):
-    if message.forward_from_chat:
-        return message.forward_from_chat
-    origin = getattr(message, "forward_origin", None)
-    if origin and hasattr(origin, "chat"):
-        return origin.chat
-    return None
-
-
-def _channel_label(ch) -> str:
-    if hasattr(ch, "username") and ch.username:
-        return f"@{ch.username}"
-    if hasattr(ch, "title") and ch.title:
-        return ch.title
-    return str(getattr(ch, "chat_id", getattr(ch, "id", "?")))
-
-
-# ─── incoming channel posts ───────────────────────────────────────────────────
-
-@router.channel_post()
-async def on_channel_post(message: Message) -> None:
-    """Store posts from registered channels as they arrive."""
-    assert db is not None and cfg is not None
-
-    ch = await db.get_channel_by_chat_id(message.chat.id)
-    if not ch:
-        return
-
-    content = message.text or message.caption
-    if not content:
-        return
-
-    text = _normalize(content)
-    if not text:
-        return
-
-    snippet = _snippet(text, cfg.snippet_chars)
-    msg_hash = _make_hash(text)
-    username = message.chat.username
-    link = f"https://t.me/{username}/{message.message_id}" if username else None
-    ts = int(message.date.replace(tzinfo=timezone.utc).timestamp()) if message.date.tzinfo is None else int(message.date.timestamp())
-
-    await db.add_message(
-        channel_id=ch.id,
-        chat_id=ch.chat_id,
-        message_id=message.message_id,
-        ts=ts,
-        text=text,
-        snippet=snippet,
-        link=link,
-        msg_hash=msg_hash,
-    )
-
-
 # ─── digest logic ─────────────────────────────────────────────────────────────
 
-async def _run_digest(bot: Bot) -> str:
+async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     assert db is not None and cfg is not None and summarizer is not None and tz is not None
 
     output_raw = await db.get_setting("output_chat_id")
     if not output_raw:
-        return "❌ Не задан output-чат. Настрой через «Куда слать»."
+        return "❌ Не задан output-чат."
 
-    channels = await db.list_channels()
+    channels = await db.list_channels_in_folder(folder.id)
     if not channels:
-        return "❌ Нет каналов для мониторинга."
+        return "⚪ Нет каналов."
 
     now = datetime.now(tz)
     now_ts = int(now.astimezone(timezone.utc).timestamp())
 
-    last_ts_str = await db.get_setting("last_digest_ts")
+    last_key = f"last_digest_ts:{folder.id}"
+    last_ts_str = await db.get_setting(last_key)
     since_ts = int(last_ts_str) if last_ts_str else None
 
     if since_ts:
-        messages = await db.fetch_messages_since(since_ts, now_ts)
+        messages = await db.fetch_messages_since_by_folder(folder.id, since_ts, now_ts)
     else:
-        messages = await db.fetch_recent_messages(cfg.history_limit)
+        messages = await db.fetch_recent_messages_by_folder(folder.id, cfg.history_limit)
 
     if not messages:
-        await db.set_setting("last_digest_ts", str(now_ts))
+        await db.set_setting(last_key, str(now_ts))
         return "ℹ️ Нет новых сообщений."
 
     keywords = [kw.casefold() for _, kw in await db.list_keywords()]
@@ -168,21 +116,39 @@ async def _run_digest(bot: Bot) -> str:
         for m in selected
     ]
 
-    start_dt = datetime.fromtimestamp(since_ts, tz=tz) if since_ts else now.replace(hour=0, minute=0, second=0, microsecond=0)
-    result = await summarizer.summarize("Дайджест", start_dt, now, items)
+    start_dt = (
+        datetime.fromtimestamp(since_ts, tz=tz)
+        if since_ts
+        else now.replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+    result = await summarizer.summarize(folder.name, start_dt, now, items)
 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
     await bot.send_message(int(output_raw), result.text, parse_mode="Markdown")
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
-    await db.set_setting("last_digest_ts", str(now_ts))
+    await db.set_setting(last_key, str(now_ts))
 
-    return f"✅ Дайджест отправлен ({len(selected)} постов). Токены: {result.tokens_in}/{result.tokens_out}"
+    return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+
+
+async def _run_all_digests(bot: Bot) -> str:
+    assert db is not None
+
+    folders = await db.list_folders()
+    if not folders:
+        return "❌ Нет папок."
+
+    lines = []
+    for folder in folders:
+        result = await _run_folder_digest(bot, folder)
+        lines.append(f"*{folder.name}*: {result}")
+
+    return "\n".join(lines)
 
 
 async def _scrape_tick() -> None:
-    """Fetch new posts from all web-scraper channels and persist them."""
     assert db is not None and cfg is not None
 
     channels = await db.list_scraper_channels()
@@ -230,7 +196,7 @@ async def _digest_tick(bot: Bot) -> None:
     _fired_slots = {s for s in _fired_slots if s.startswith(today)}
 
     async with digest_lock:
-        await _run_digest(bot)
+        await _run_all_digests(bot)
 
 
 # ─── UI helpers ───────────────────────────────────────────────────────────────
@@ -246,49 +212,45 @@ async def _show_menu(target: Message | CallbackQuery, state: FSMContext) -> None
         await target.answer(MENU_TEXT, parse_mode="Markdown", reply_markup=kb_main())
 
 
-async def _show_channels(target: Message | CallbackQuery) -> None:
+async def _show_folders(target: Message | CallbackQuery) -> None:
     assert db is not None
-    channels = await db.list_channels()
+    folders = await db.list_folders()
+    counts = {}
+    for f in folders:
+        counts[f.id] = await db.count_channels_in_folder(f.id)
+
+    if folders:
+        text = f"📁 *Папки* ({len(folders)}):\n\nНажми на папку, чтобы открыть её."
+    else:
+        text = "📁 *Папки*\n\n_Пока нет папок. Создай первую!_"
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_folders(folders, counts))
+    else:
+        await target.answer(text, parse_mode="Markdown", reply_markup=kb_folders(folders, counts))
+
+
+async def _show_folder(target: Message | CallbackQuery, folder: Folder) -> None:
+    assert db is not None
+    channels = await db.list_channels_in_folder(folder.id)
+
     if channels:
-        lines = "\n".join(f"• {_channel_label(ch)}" for ch in channels)
-        text = (
-            f"📢 *Каналы* ({len(channels)}):\n\n{lines}\n\n"
-            "_Добавь бота как администратора в каждый канал, чтобы он получал посты._"
+        lines = "\n".join(
+            f"• @{ch.username}" if ch.username else f"• {ch.title or ch.chat_id}"
+            for ch in channels
+        )
+        text = f"📁 *{folder.name}*\n\n{lines}\n\n_Посты забираются автоматически через t.me/s/_"
+    else:
+        text = f"📁 *{folder.name}*\n\n_Каналов нет. Добавь первый!_"
+
+    if isinstance(target, CallbackQuery):
+        await target.message.edit_text(
+            text, parse_mode="Markdown", reply_markup=kb_folder(folder, channels)
         )
     else:
-        text = "📢 *Каналы*\n\n_Пока нет ни одного канала._"
-    if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_channels(channels))
-    else:
-        await target.answer(text, parse_mode="Markdown", reply_markup=kb_channels(channels))
-
-
-async def _show_keywords(target: Message | CallbackQuery) -> None:
-    assert db is not None
-    keywords = await db.list_keywords()
-    if keywords:
-        lines = "\n".join(f"• {kw}" for _, kw in keywords)
-        text = f"🔑 *Ключевые слова*:\n\n{lines}\n\n_Если пусто — берутся все посты._"
-    else:
-        text = "🔑 *Ключевые слова*\n\n_Пока нет. Если не задать — берутся все посты._"
-    if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_keywords(keywords))
-    else:
-        await target.answer(text, parse_mode="Markdown", reply_markup=kb_keywords(keywords))
-
-
-async def _show_schedule(target: Message | CallbackQuery) -> None:
-    assert db is not None
-    times = await db.list_schedule()
-    if times:
-        lines = "\n".join(f"• {t}" for _, t in times)
-        text = f"⏰ *Расписание* дайджестов:\n\n{lines}"
-    else:
-        text = "⏰ *Расписание*\n\n_Дайджесты не запланированы._"
-    if isinstance(target, CallbackQuery):
-        await target.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_schedule(times))
-    else:
-        await target.answer(text, parse_mode="Markdown", reply_markup=kb_schedule(times))
+        await target.answer(
+            text, parse_mode="Markdown", reply_markup=kb_folder(folder, channels)
+        )
 
 
 # ─── /start & /help ───────────────────────────────────────────────────────────
@@ -318,30 +280,190 @@ async def cb_noop(cq: CallbackQuery) -> None:
     await cq.answer()
 
 
-# ─── Callbacks: channels ──────────────────────────────────────────────────────
+# ─── Callbacks: folders ───────────────────────────────────────────────────────
 
-@router.callback_query(F.data == "ch:list")
-async def cb_ch_list(cq: CallbackQuery) -> None:
+@router.callback_query(F.data == "fold:list")
+async def cb_fold_list(cq: CallbackQuery) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
     await cq.answer()
-    await _show_channels(cq)
+    await _show_folders(cq)
 
 
-@router.callback_query(F.data == "ch:add")
-async def cb_ch_add(cq: CallbackQuery, state: FSMContext) -> None:
+@router.callback_query(F.data.startswith("fold:view:"))
+async def cb_fold_view(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+    folder_id = int(cq.data.split(":")[2])
+    folder = await db.get_folder(folder_id)
+    if not folder:
+        await cq.answer("Папка не найдена.", show_alert=True)
+        return
+    await cq.answer()
+    await _show_folder(cq, folder)
+
+
+@router.callback_query(F.data == "fold:add")
+async def cb_fold_add(cq: CallbackQuery, state: FSMContext) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
     await cq.answer()
-    await state.set_state(S.add_channel)
+    await state.set_state(S.add_folder)
     await cq.message.edit_text(
-        "📢 *Добавить канал*\n\n"
-        "Перешли любой пост из канала\nили введи @username / числовой ID:\n\n"
-        "_После добавления не забудь назначить бота администратором канала._",
+        "📁 *Создать папку*\n\n"
+        "Введи название (можно с эмодзи):\n"
+        "_Например: 🤖 Нейросети_",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
+    )
+
+
+@router.message(S.add_folder)
+async def fsm_add_folder(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    assert db is not None
+
+    name = _normalize(message.text or "")
+    if not name:
+        await message.answer("Введи название папки.", reply_markup=kb_cancel())
+        return
+
+    folder_id, created = await db.add_folder(name)
+    await state.clear()
+
+    if not created:
+        await message.answer(
+            f"ℹ️ Папка *{name}* уже существует.",
+            parse_mode="Markdown",
+            reply_markup=kb_back_to_folders(),
+        )
+        return
+
+    await message.answer(
+        f"✅ Папка *{name}* создана!",
+        parse_mode="Markdown",
+        reply_markup=kb_back_to_folders(),
+    )
+
+
+@router.callback_query(F.data.startswith("fold:del:"))
+async def cb_fold_del(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+    folder_id = int(cq.data.split(":")[2])
+    cnt = await db.count_channels_in_folder(folder_id)
+    if cnt > 0:
+        await cq.answer(
+            f"Нельзя удалить: в папке {cnt} каналов. Удали сначала каналы.",
+            show_alert=True,
+        )
+        return
+    await db.remove_folder(folder_id)
+    await cq.answer("🗑️ Папка удалена")
+    await _show_folders(cq)
+
+
+@router.callback_query(F.data.startswith("fold:digest:"))
+async def cb_fold_digest(cq: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+    folder_id = int(cq.data.split(":")[2])
+    folder = await db.get_folder(folder_id)
+    if not folder:
+        await cq.answer("Папка не найдена.", show_alert=True)
+        return
+
+    await cq.answer("⏳ Запускаю...")
+    await cq.message.edit_text(
+        f"⏳ Генерирую дайджест папки *{folder.name}*...",
+        parse_mode="Markdown",
+        reply_markup=None,
+    )
+    async with digest_lock:
+        result = await _run_folder_digest(bot, folder)
+
+    await cq.message.edit_text(
+        f"*{folder.name}*\n\n{result}",
+        parse_mode="Markdown",
+        reply_markup=kb_back_to_folder(folder_id),
+    )
+
+
+# ─── Callbacks: channels in folder ────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("ch:add_in:"))
+async def cb_ch_add_in(cq: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    folder_id = int(cq.data.split(":")[2])
+    await cq.answer()
+    await state.set_state(S.add_channel_in_folder)
+    await state.update_data(folder_id=folder_id)
+    await cq.message.edit_text(
+        "🌐 *Добавить канал*\n\n"
+        "Введи @username публичного канала.\n\n"
+        "_Посты забираются через t.me/s/ — добавлять бота в канал не нужно._",
+        parse_mode="Markdown",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(S.add_channel_in_folder)
+async def fsm_add_channel_in_folder(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    assert db is not None
+
+    data = await state.get_data()
+    folder_id: int = data.get("folder_id", -1)
+
+    raw = (message.text or "").strip().lstrip("@")
+    if not raw or not re.match(r"^[a-zA-Z0-9_]{3,}$", raw):
+        await message.answer(
+            "Введи корректный @username (только латиница, цифры, _).",
+            reply_markup=kb_cancel(),
+        )
+        return
+
+    await message.answer("⏳ Проверяю канал...")
+    try:
+        posts = await fetch_channel_posts(raw, limit=1)
+    except Exception as exc:
+        await state.clear()
+        await message.answer(
+            f"❌ Не удалось получить посты: {exc}\n\n"
+            "Убедись, что канал публичный и правильно написан @username.",
+            reply_markup=kb_back_to_folder(folder_id),
+        )
+        return
+
+    channel_id, created = await db.add_scraper_channel(raw, folder_id=folder_id)
+    await state.clear()
+
+    posts_hint = f" (найдено {len(posts)} постов)" if posts else ""
+    if not created:
+        await message.answer(
+            f"ℹ️ Канал *@{raw}* уже добавлен (перемещён в эту папку){posts_hint}.",
+            parse_mode="Markdown",
+            reply_markup=kb_back_to_folder(folder_id),
+        )
+        return
+
+    await message.answer(
+        f"✅ Канал *@{raw}* добавлен{posts_hint}.\n\n"
+        "_Посты будут забираться автоматически каждые 15 минут._",
+        parse_mode="Markdown",
+        reply_markup=kb_back_to_folder(folder_id),
     )
 
 
@@ -352,132 +474,21 @@ async def cb_ch_del(cq: CallbackQuery) -> None:
         return
     assert db is not None
     channel_id = int(cq.data.split(":")[2])
+
+    # get folder_id before deleting
+    channels = await db.list_all_channels()
+    ch = next((c for c in channels if c.id == channel_id), None)
+    folder_id = ch.folder_id if ch else None
+
     await db.remove_channel(channel_id)
     await cq.answer("🗑️ Удалено")
-    await _show_channels(cq)
 
-
-@router.callback_query(F.data == "ch:add_web")
-async def cb_ch_add_web(cq: CallbackQuery, state: FSMContext) -> None:
-    if not _is_admin(cq.from_user.id):
-        await cq.answer()
-        return
-    await cq.answer()
-    await state.set_state(S.add_scraper_channel)
-    await cq.message.edit_text(
-        "🌐 *Добавить канал через веб-парсер*\n\n"
-        "Введи @username публичного канала.\n\n"
-        "_Бот будет сам забирать посты через t.me/s/ — "
-        "добавлять его администратором не нужно._",
-        parse_mode="Markdown",
-        reply_markup=kb_cancel(),
-    )
-
-
-@router.message(S.add_scraper_channel)
-async def fsm_add_scraper_channel(message: Message, state: FSMContext) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    assert db is not None
-
-    raw = (message.text or "").strip().lstrip("@")
-    if not raw or not re.match(r"^[a-zA-Z0-9_]{3,}$", raw):
-        await message.answer(
-            "Введи корректный @username канала (только латиница, цифры, _).",
-            reply_markup=kb_cancel(),
-        )
-        return
-
-    # quick connectivity check
-    await message.answer("⏳ Проверяю канал...", reply_markup=kb_cancel())
-    try:
-        posts = await fetch_channel_posts(raw, limit=1)
-    except Exception as exc:
-        await state.clear()
-        await message.answer(
-            f"❌ Не удалось получить посты: {exc}\n\n"
-            "Убедись, что канал публичный и правильно написан @username.",
-            reply_markup=kb_back(),
-        )
-        return
-
-    channel_id, created = await db.add_scraper_channel(raw, title=None)
-    await state.clear()
-
-    if not created:
-        await message.answer(
-            f"ℹ️ Канал *@{raw}* уже добавлен.",
-            parse_mode="Markdown",
-            reply_markup=kb_back(),
-        )
-        return
-
-    posts_hint = f" (найдено {len(posts)} постов в открытом доступе)" if posts else ""
-    await message.answer(
-        f"✅ Канал *@{raw}* добавлен через веб-парсер{posts_hint}.\n\n"
-        "_Посты будут забираться автоматически каждые 15 минут._",
-        parse_mode="Markdown",
-        reply_markup=kb_back(),
-    )
-
-
-@router.message(S.add_channel)
-async def fsm_add_channel(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not _is_admin(message.from_user.id):
-        return
-    assert db is not None
-
-    chat = _extract_forwarded_chat(message)
-
-    if chat:
-        existing = await db.get_channel_by_chat_id(chat.id)
-        if existing:
-            await state.clear()
-            await message.answer(
-                f"ℹ️ Канал *{chat.title}* уже добавлен.",
-                parse_mode="Markdown",
-                reply_markup=kb_back(),
-            )
+    if folder_id:
+        folder = await db.get_folder(folder_id)
+        if folder:
+            await _show_folder(cq, folder)
             return
-        await db.add_channel(chat_id=chat.id, username=chat.username, title=chat.title)
-        await state.clear()
-        label = f"@{chat.username}" if chat.username else chat.title
-        await message.answer(
-            f"✅ Канал *{label}* добавлен!\n\nНазначь бота администратором канала, чтобы он получал посты.",
-            parse_mode="Markdown",
-            reply_markup=kb_back(),
-        )
-        return
-
-    raw = (message.text or "").strip()
-    if not raw:
-        await message.answer("Перешли пост из канала или введи @username.", reply_markup=kb_cancel())
-        return
-
-    identifier = raw.lstrip("@")
-    try:
-        chat_obj = await bot.get_chat(int(identifier) if identifier.lstrip("-").isdigit() else f"@{identifier}")
-    except Exception:
-        await message.answer(
-            "❌ Канал не найден. Убедись, что канал публичный, и попробуй ещё раз.",
-            reply_markup=kb_cancel(),
-        )
-        return
-
-    existing = await db.get_channel_by_chat_id(chat_obj.id)
-    if existing:
-        await state.clear()
-        await message.answer("ℹ️ Канал уже добавлен.", reply_markup=kb_back())
-        return
-
-    await db.add_channel(chat_id=chat_obj.id, username=chat_obj.username, title=chat_obj.title)
-    await state.clear()
-    label = f"@{chat_obj.username}" if chat_obj.username else chat_obj.title
-    await message.answer(
-        f"✅ Канал *{label}* добавлен!\n\nНазначь бота администратором канала, чтобы он получал посты.",
-        parse_mode="Markdown",
-        reply_markup=kb_back(),
-    )
+    await _show_folders(cq)
 
 
 # ─── Callbacks: keywords ──────────────────────────────────────────────────────
@@ -487,8 +498,15 @@ async def cb_kw_list(cq: CallbackQuery) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
+    assert db is not None
     await cq.answer()
-    await _show_keywords(cq)
+    keywords = await db.list_keywords()
+    if keywords:
+        lines = "\n".join(f"• {kw}" for _, kw in keywords)
+        text = f"🔑 *Ключевые слова*:\n\n{lines}\n\n_Если пусто — берутся все посты._"
+    else:
+        text = "🔑 *Ключевые слова*\n\n_Пока нет. Если не задать — берутся все посты._"
+    await cq.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_keywords(keywords))
 
 
 @router.callback_query(F.data == "kw:add")
@@ -514,7 +532,13 @@ async def cb_kw_del(cq: CallbackQuery) -> None:
     kw_id = int(cq.data.split(":")[2])
     await db.remove_keyword(kw_id)
     await cq.answer("🗑️ Удалено")
-    await _show_keywords(cq)
+    keywords = await db.list_keywords()
+    if keywords:
+        lines = "\n".join(f"• {kw}" for _, kw in keywords)
+        text = f"🔑 *Ключевые слова*:\n\n{lines}"
+    else:
+        text = "🔑 *Ключевые слова*\n\n_Пока нет._"
+    await cq.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_keywords(keywords))
 
 
 @router.message(S.add_keyword)
@@ -541,8 +565,15 @@ async def cb_sch_list(cq: CallbackQuery) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
+    assert db is not None
     await cq.answer()
-    await _show_schedule(cq)
+    times = await db.list_schedule()
+    if times:
+        lines = "\n".join(f"• {t}" for _, t in times)
+        text = f"⏰ *Расписание* дайджестов:\n\n{lines}"
+    else:
+        text = "⏰ *Расписание*\n\n_Дайджесты не запланированы._"
+    await cq.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_schedule(times))
 
 
 @router.callback_query(F.data == "sch:add")
@@ -568,7 +599,13 @@ async def cb_sch_del(cq: CallbackQuery) -> None:
     sch_id = int(cq.data.split(":")[2])
     await db.remove_schedule_time(sch_id)
     await cq.answer("🗑️ Удалено")
-    await _show_schedule(cq)
+    times = await db.list_schedule()
+    if times:
+        lines = "\n".join(f"• {t}" for _, t in times)
+        text = f"⏰ *Расписание*:\n\n{lines}"
+    else:
+        text = "⏰ *Расписание*\n\n_Нет._"
+    await cq.message.edit_text(text, parse_mode="Markdown", reply_markup=kb_schedule(times))
 
 
 @router.message(S.add_schedule)
@@ -617,8 +654,7 @@ async def cb_out_set(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.set_output)
     await cq.message.edit_text(
         "📤 *Задать output-чат*\n\n"
-        "Перешли любое сообщение из целевого канала/чата\n"
-        "или введи @username / числовой ID чата:",
+        "Введи @username или числовой ID чата:",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
     )
@@ -630,17 +666,9 @@ async def fsm_set_output(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     assert db is not None
 
-    chat = _extract_forwarded_chat(message)
-    if chat:
-        await db.set_setting("output_chat_id", str(chat.id))
-        await state.clear()
-        label = f"@{chat.username}" if chat.username else chat.title
-        await message.answer(f"✅ Output-чат: *{label}*", parse_mode="Markdown", reply_markup=kb_back())
-        return
-
     raw = (message.text or "").strip()
     if not raw:
-        await message.answer("Перешли сообщение или введи @username / ID.", reply_markup=kb_cancel())
+        await message.answer("Введи @username или числовой ID.", reply_markup=kb_cancel())
         return
 
     identifier = raw.lstrip("@")
@@ -670,10 +698,10 @@ async def cb_digest_now(cq: CallbackQuery, bot: Bot) -> None:
         await cq.answer()
         return
     await cq.answer("⏳ Запускаю...")
-    await cq.message.edit_text("⏳ Генерирую дайджест...", reply_markup=None)
+    await cq.message.edit_text("⏳ Генерирую дайджесты всех папок...", reply_markup=None)
     async with digest_lock:
-        result = await _run_digest(bot)
-    await cq.message.edit_text(result, reply_markup=kb_back())
+        result = await _run_all_digests(bot)
+    await cq.message.edit_text(result, parse_mode="Markdown", reply_markup=kb_back())
 
 
 @router.callback_query(F.data == "status:show")
@@ -684,29 +712,25 @@ async def cb_status(cq: CallbackQuery) -> None:
     assert db is not None
     await cq.answer()
 
-    channels = await db.list_channels()
+    folders = await db.list_folders()
     schedule = await db.list_schedule()
     output = await db.get_setting("output_chat_id")
-    last_ts = await db.get_setting("last_digest_ts")
     stats = await db.get_token_stats()
 
-    ch_list = "\n".join(f"  • {_channel_label(ch)}" for ch in channels) or "  _нет_"
+    folder_lines = []
+    for f in folders:
+        cnt = await db.count_channels_in_folder(f.id)
+        folder_lines.append(f"  {f.name} ({cnt} каналов)")
+    folders_str = "\n".join(folder_lines) or "  _нет_"
+
     sch_list = ", ".join(t for _, t in schedule) or "_нет_"
-
-    if last_ts:
-        last_dt = datetime.fromtimestamp(int(last_ts), tz=tz)
-        last_str = last_dt.strftime("%d.%m %H:%M")
-    else:
-        last_str = "_никогда_"
-
     cost = (stats["total_in"] * 0.15 + stats["total_out"] * 0.60) / 1_000_000
 
     text = (
         "📊 *Статус*\n\n"
-        f"📢 Каналы ({len(channels)}):\n{ch_list}\n\n"
+        f"📁 Папки ({len(folders)}):\n{folders_str}\n\n"
         f"⏰ Расписание: {sch_list}\n"
         f"📤 Output-чат: `{output or 'не задан'}`\n"
-        f"🕐 Последний дайджест: {last_str}\n"
         f"🔢 Токены: {stats['total_in']} вх. / {stats['total_out']} исх. (~${cost:.4f})\n"
         f"📨 Всего дайджестов: {stats['count']}"
     )
