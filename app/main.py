@@ -74,6 +74,14 @@ def _make_hash(text: str) -> str:
     return hashlib.sha256(text.lower().encode()).hexdigest()
 
 
+async def _send_digest_message(bot: Bot, chat_id: int, text: str) -> None:
+    """Send digest text with Markdown, fall back to plain text on parse error."""
+    try:
+        await bot.send_message(chat_id, text, parse_mode="Markdown", reply_markup=kb_back())
+    except Exception:
+        await bot.send_message(chat_id, text, reply_markup=kb_back())
+
+
 # ─── digest logic ─────────────────────────────────────────────────────────────
 
 async def _run_folder_digest(bot: Bot, folder: Folder, progress_msg: Message | None = None) -> str:
@@ -178,7 +186,7 @@ async def _run_folder_digest(bot: Bot, folder: Folder, progress_msg: Message | N
         return "⚠️ LLM вернул пустой ответ."
 
     try:
-        await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+        await _send_digest_message(bot, int(output_raw), result.text)
     except Exception as exc:
         return f"❌ Ошибка отправки: {exc}"
 
@@ -275,7 +283,7 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int, pro
         return "⚠️ LLM вернул пустой ответ."
 
     try:
-        await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+        await _send_digest_message(bot, int(output_raw), result.text)
     except Exception as exc:
         return f"❌ Ошибка отправки: {exc}"
 
