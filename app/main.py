@@ -15,6 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .config import load_config, Config
 from .db import Database
+from .scraper import fetch_channel_posts
 from .summarizer import Summarizer, DigestItem
 from .keyboards import (
     kb_main, kb_channels, kb_keywords, kb_schedule,
@@ -37,10 +38,11 @@ router = Router()
 # ─── FSM states ──────────────────────────────────────────────────────────────
 
 class S(StatesGroup):
-    add_channel  = State()
-    add_keyword  = State()
-    add_schedule = State()
-    set_output   = State()
+    add_channel        = State()
+    add_scraper_channel = State()
+    add_keyword        = State()
+    add_schedule       = State()
+    set_output         = State()
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -177,6 +179,37 @@ async def _run_digest(bot: Bot) -> str:
     await db.set_setting("last_digest_ts", str(now_ts))
 
     return f"✅ Дайджест отправлен ({len(selected)} постов). Токены: {result.tokens_in}/{result.tokens_out}"
+
+
+async def _scrape_tick() -> None:
+    """Fetch new posts from all web-scraper channels and persist them."""
+    assert db is not None and cfg is not None
+
+    channels = await db.list_scraper_channels()
+    if not channels:
+        return
+
+    for ch in channels:
+        if not ch.username:
+            continue
+        try:
+            posts = await fetch_channel_posts(ch.username, limit=20)
+        except Exception:
+            continue
+
+        for post in posts:
+            snippet = _snippet(post.text, cfg.snippet_chars)
+            msg_hash = _make_hash(post.text)
+            await db.add_message(
+                channel_id=ch.id,
+                chat_id=ch.chat_id,
+                message_id=post.message_id,
+                ts=post.ts,
+                text=post.text,
+                snippet=snippet,
+                link=post.link,
+                msg_hash=msg_hash,
+            )
 
 
 async def _digest_tick(bot: Bot) -> None:
@@ -322,6 +355,70 @@ async def cb_ch_del(cq: CallbackQuery) -> None:
     await db.remove_channel(channel_id)
     await cq.answer("🗑️ Удалено")
     await _show_channels(cq)
+
+
+@router.callback_query(F.data == "ch:add_web")
+async def cb_ch_add_web(cq: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    await cq.answer()
+    await state.set_state(S.add_scraper_channel)
+    await cq.message.edit_text(
+        "🌐 *Добавить канал через веб-парсер*\n\n"
+        "Введи @username публичного канала.\n\n"
+        "_Бот будет сам забирать посты через t.me/s/ — "
+        "добавлять его администратором не нужно._",
+        parse_mode="Markdown",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(S.add_scraper_channel)
+async def fsm_add_scraper_channel(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    assert db is not None
+
+    raw = (message.text or "").strip().lstrip("@")
+    if not raw or not re.match(r"^[a-zA-Z0-9_]{3,}$", raw):
+        await message.answer(
+            "Введи корректный @username канала (только латиница, цифры, _).",
+            reply_markup=kb_cancel(),
+        )
+        return
+
+    # quick connectivity check
+    await message.answer("⏳ Проверяю канал...", reply_markup=kb_cancel())
+    try:
+        posts = await fetch_channel_posts(raw, limit=1)
+    except Exception as exc:
+        await state.clear()
+        await message.answer(
+            f"❌ Не удалось получить посты: {exc}\n\n"
+            "Убедись, что канал публичный и правильно написан @username.",
+            reply_markup=kb_back(),
+        )
+        return
+
+    channel_id, created = await db.add_scraper_channel(raw, title=None)
+    await state.clear()
+
+    if not created:
+        await message.answer(
+            f"ℹ️ Канал *@{raw}* уже добавлен.",
+            parse_mode="Markdown",
+            reply_markup=kb_back(),
+        )
+        return
+
+    posts_hint = f" (найдено {len(posts)} постов в открытом доступе)" if posts else ""
+    await message.answer(
+        f"✅ Канал *@{raw}* добавлен через веб-парсер{posts_hint}.\n\n"
+        "_Посты будут забираться автоматически каждые 15 минут._",
+        parse_mode="Markdown",
+        reply_markup=kb_back(),
+    )
 
 
 @router.message(S.add_channel)
@@ -634,6 +731,7 @@ async def main() -> None:
 
     scheduler = AsyncIOScheduler(timezone=cfg.timezone)
     scheduler.add_job(_digest_tick, "interval", seconds=60, args=[bot])
+    scheduler.add_job(_scrape_tick, "interval", seconds=cfg.scrape_interval)
     scheduler.start()
 
     try:

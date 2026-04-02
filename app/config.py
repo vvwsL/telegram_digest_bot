@@ -41,6 +41,7 @@ class Config:
     db_path: str
     admin_ids: set[int]
     history_limit: int
+    scrape_interval: int  # seconds between web-scraper runs
 
 
 def load_config() -> Config:
@@ -54,4 +55,5 @@ def load_config() -> Config:
         db_path=os.getenv("DB_PATH", os.path.join("data", "bot.db")),
         admin_ids=_parse_admin_ids(_get_env("ADMIN_IDS")),
         history_limit=_parse_int(os.getenv("HISTORY_LIMIT", "30"), "HISTORY_LIMIT"),
+        scrape_interval=_parse_int(os.getenv("SCRAPE_INTERVAL", "900"), "SCRAPE_INTERVAL"),
     )

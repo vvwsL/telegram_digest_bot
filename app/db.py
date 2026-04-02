@@ -55,7 +55,8 @@ class Database:
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL UNIQUE,
             username TEXT,
-            title TEXT
+            title TEXT,
+            scraper INTEGER NOT NULL DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS schedule (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -95,6 +96,15 @@ class Database:
         async with self._lock:
             await self._conn.executescript(schema)
             await self._conn.commit()
+        # migration: add scraper column to existing databases
+        try:
+            async with self._lock:
+                await self._conn.execute(
+                    "ALTER TABLE channels ADD COLUMN scraper INTEGER NOT NULL DEFAULT 0"
+                )
+                await self._conn.commit()
+        except Exception:
+            pass  # column already exists
 
     async def _execute(self, query: str, params: tuple[Any, ...] = ()) -> aiosqlite.Cursor:
         assert self._conn is not None
@@ -144,6 +154,34 @@ class Database:
         if not row:
             return None
         return Channel(id=row["id"], chat_id=row["chat_id"], username=row["username"], title=row["title"])
+
+    async def add_scraper_channel(self, username: str, title: str | None) -> tuple[int, bool]:
+        """
+        Register a channel for web-scraping via t.me/s/.
+        Returns (channel_id, created) — created=False if already existed.
+        Uses a synthetic chat_id so the UNIQUE constraint is satisfied.
+        """
+        from .scraper import synthetic_chat_id
+        uname = username.lstrip("@").lower()
+        chat_id = synthetic_chat_id(uname)
+        cur = await self._execute(
+            "INSERT OR IGNORE INTO channels(chat_id, username, title, scraper) VALUES (?, ?, ?, 1)",
+            (chat_id, uname, title),
+        )
+        if cur.rowcount == 0:
+            row = await self._fetchone(
+                "SELECT id FROM channels WHERE username = ? AND scraper = 1", (uname,)
+            )
+            return (row["id"] if row else -1), False
+        return cur.lastrowid, True
+
+    async def list_scraper_channels(self) -> list[Channel]:
+        """Return only channels tracked via the web scraper."""
+        rows = await self._fetchall(
+            "SELECT id, chat_id, username, title FROM channels"
+            " WHERE scraper = 1 AND username IS NOT NULL"
+        )
+        return [Channel(id=r["id"], chat_id=r["chat_id"], username=r["username"], title=r["title"]) for r in rows]
 
     # ── Schedule ──────────────────────────────────────────────────────────────
 

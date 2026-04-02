@@ -27,7 +27,7 @@ def kb_channels(channels: list[Channel]) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text=f"📢 {label[:35]}", callback_data="noop"),
             _btn("🗑️", f"ch:del:{ch.id}"),
         )
-    b.row(_btn("➕ Добавить канал", "ch:add"))
+    b.row(_btn("➕ Добавить (Bot API)", "ch:add"), _btn("🌐 Добавить (Web)", "ch:add_web"))
     b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
