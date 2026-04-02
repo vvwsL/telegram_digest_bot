@@ -90,28 +90,27 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     last_ts_str = await db.get_setting(last_key)
     since_ts = int(last_ts_str) if last_ts_str else None
 
-    # first digest for this folder — scrape channels immediately so there's something to show
-    if since_ts is None:
-        for ch in channels:
-            if not ch.username:
-                continue
-            try:
-                posts = await fetch_channel_posts(ch.username, limit=20)
-            except Exception:
-                continue
-            for post in posts:
-                snippet = _snippet(post.text, cfg.snippet_chars)
-                msg_hash = _make_hash(post.text)
-                await db.add_message(
-                    channel_id=ch.id,
-                    chat_id=ch.chat_id,
-                    message_id=post.message_id,
-                    ts=post.ts,
-                    text=post.text,
-                    snippet=snippet,
-                    link=post.link,
-                    msg_hash=msg_hash,
-                )
+    # always scrape fresh posts before building a digest
+    for ch in channels:
+        if not ch.username:
+            continue
+        try:
+            posts = await fetch_channel_posts(ch.username, limit=20)
+        except Exception:
+            continue
+        for post in posts:
+            snippet = _snippet(post.text, cfg.snippet_chars)
+            msg_hash = _make_hash(post.text)
+            await db.add_message(
+                channel_id=ch.id,
+                chat_id=ch.chat_id,
+                message_id=post.message_id,
+                ts=post.ts,
+                text=post.text,
+                snippet=snippet,
+                link=post.link,
+                msg_hash=msg_hash,
+            )
 
     if since_ts:
         messages = await db.fetch_messages_since_by_folder(folder.id, since_ts, now_ts)
