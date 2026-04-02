@@ -75,7 +75,7 @@ def _make_hash(text: str) -> str:
 
 # ─── digest logic ─────────────────────────────────────────────────────────────
 
-async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
+async def _run_folder_digest(bot: Bot, folder: Folder, progress_msg: Message | None = None) -> str:
     assert db is not None and cfg is not None and summarizer is not None and tz is not None
 
     output_raw = await db.get_setting("output_chat_id")
@@ -94,12 +94,22 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     since_ts = int(last_ts_str) if last_ts_str else None
 
     # always scrape fresh posts before building a digest
+    scrape_errors: list[str] = []
     for ch in channels:
         if not ch.username:
             continue
+        if progress_msg:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ *{folder.name}*: скрапинг @{ch.username}...",
+                    parse_mode="Markdown", reply_markup=None,
+                )
+            except Exception:
+                pass
         try:
             posts = await fetch_channel_posts(ch.username, limit=20)
-        except Exception:
+        except Exception as exc:
+            scrape_errors.append(f"@{ch.username}: {exc}")
             continue
         for post in posts:
             snippet = _snippet(post.text, cfg.snippet_chars)
@@ -122,7 +132,8 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
 
     if not messages:
         await db.set_setting(last_key, str(now_ts))
-        return "ℹ️ Нет новых сообщений."
+        err = f"\n⚠️ Ошибки: {'; '.join(scrape_errors)}" if scrape_errors else ""
+        return f"ℹ️ Нет новых сообщений.{err}"
 
     keywords = [kw.casefold() for _, kw in await db.list_keywords()]
     important_ids = {
@@ -145,19 +156,37 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
         if since_ts
         else now.replace(hour=0, minute=0, second=0, microsecond=0)
     )
-    result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
+
+    if progress_msg:
+        try:
+            await progress_msg.edit_text(
+                f"⏳ *{folder.name}*: генерирую дайджест ({len(messages)} постов)...",
+                parse_mode="Markdown", reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    try:
+        result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
+    except Exception as exc:
+        return f"❌ Ошибка LLM: {exc}"
 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
-    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+    try:
+        await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+    except Exception as exc:
+        return f"❌ Ошибка отправки: {exc}"
+
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     await db.set_setting(last_key, str(now_ts))
 
-    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+    err = f"\n⚠️ Ошибки: {'; '.join(scrape_errors)}" if scrape_errors else ""
+    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}{err}"
 
 
-async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> str:
+async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int, progress_msg: Message | None = None) -> str:
     """One-off digest: scrape + summarize last N days, don't update last_digest_ts."""
     assert db is not None and cfg is not None and summarizer is not None and tz is not None
 
@@ -173,12 +202,22 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
     now_ts = int(now.astimezone(timezone.utc).timestamp())
     since_ts = now_ts - days * 86400
 
+    scrape_errors: list[str] = []
     for ch in channels:
         if not ch.username:
             continue
+        if progress_msg:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ *{folder.name}*: скрапинг @{ch.username}...",
+                    parse_mode="Markdown", reply_markup=None,
+                )
+            except Exception:
+                pass
         try:
             posts = await fetch_channel_posts(ch.username, limit=20)
-        except Exception:
+        except Exception as exc:
+            scrape_errors.append(f"@{ch.username}: {exc}")
             continue
         for post in posts:
             snippet = _snippet(post.text, cfg.snippet_chars)
@@ -192,7 +231,8 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
 
     messages = await db.fetch_messages_since_by_folder(folder.id, since_ts, now_ts)
     if not messages:
-        return "ℹ️ Нет сообщений за этот период."
+        err = f"\n⚠️ Ошибки: {'; '.join(scrape_errors)}" if scrape_errors else ""
+        return f"ℹ️ Нет сообщений за этот период.{err}"
 
     keywords = [kw.casefold() for _, kw in await db.list_keywords()]
     important_ids = {
@@ -211,14 +251,32 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
     ]
 
     start_dt = datetime.fromtimestamp(since_ts, tz=tz)
-    result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
+
+    if progress_msg:
+        try:
+            await progress_msg.edit_text(
+                f"⏳ *{folder.name}*: генерирую дайджест ({len(messages)} постов)...",
+                parse_mode="Markdown", reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    try:
+        result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
+    except Exception as exc:
+        return f"❌ Ошибка LLM: {exc}"
 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
-    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+    try:
+        await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
+    except Exception as exc:
+        return f"❌ Ошибка отправки: {exc}"
+
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
-    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+    err = f"\n⚠️ Ошибки: {'; '.join(scrape_errors)}" if scrape_errors else ""
+    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}{err}"
 
 
 async def _run_all_digests(bot: Bot, progress_msg: Message | None = None) -> str:
@@ -240,7 +298,7 @@ async def _run_all_digests(bot: Bot, progress_msg: Message | None = None) -> str
                 )
             except Exception:
                 pass
-        result = await _run_folder_digest(bot, folder)
+        result = await _run_folder_digest(bot, folder, progress_msg=progress_msg)
         lines.append(f"*{folder.name}*: {result}")
 
     return "\n".join(lines)
@@ -491,7 +549,7 @@ async def cb_fold_digest(cq: CallbackQuery, bot: Bot) -> None:
         reply_markup=None,
     )
     async with digest_lock:
-        result = await _run_folder_digest(bot, folder)
+        result = await _run_folder_digest(bot, folder, progress_msg=cq.message)
 
     await cq.message.edit_text(
         f"*{folder.name}*\n\n{result}",
@@ -962,7 +1020,7 @@ async def cb_oneoff_period(cq: CallbackQuery, bot: Bot) -> None:
                 parse_mode="Markdown",
                 reply_markup=None,
             )
-            result = await _run_folder_digest_for_period(bot, folder, days)
+            result = await _run_folder_digest_for_period(bot, folder, days, progress_msg=cq.message)
             lines.append(f"*{folder.name}*: {result}")
 
     await cq.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
