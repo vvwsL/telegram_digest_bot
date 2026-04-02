@@ -109,3 +109,11 @@ def kb_back_to_folder(folder_id: int) -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(_btn("🔙 Назад", f"fold:view:{folder_id}"))
     return b.as_markup()
+
+
+def kb_folder_prompt(folder_id: int) -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(_btn("✏️ Изменить", f"fold:prompt_edit:{folder_id}"))
+    b.row(_btn("🔄 Сбросить по умолчанию", f"fold:prompt_reset:{folder_id}"))
+    b.row(_btn("🔙 Назад", f"fold:view:{folder_id}"))
+    return b.as_markup()

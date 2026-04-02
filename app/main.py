@@ -22,6 +22,7 @@ from .keyboards import (
     kb_main, kb_folders, kb_folder,
     kb_keywords, kb_schedule, kb_output, kb_digest_period,
     kb_cancel, kb_back, kb_back_to_folders, kb_back_to_folder,
+    kb_folder_prompt,
 )
 
 
@@ -614,18 +615,12 @@ async def cb_fold_prompt(cq: CallbackQuery) -> None:
         return
     await cq.answer()
 
-    from .summarizer import Summarizer
     current = folder.prompt or Summarizer.DEFAULT_SYSTEM
     text = (
         f"<b>📝 Промт для «{_html.escape(folder.name)}»</b>\n\n"
         f"<code>{_html.escape(current)}</code>"
     )
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"fold:prompt_edit:{folder_id}")],
-        [InlineKeyboardButton(text="🔄 Сбросить по умолчанию", callback_data=f"fold:prompt_reset:{folder_id}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fold:view:{folder_id}")],
-    ])
-    await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb_folder_prompt(folder_id))
 
 
 @router.callback_query(F.data.startswith("fold:prompt_edit:"))
@@ -844,7 +839,9 @@ async def cb_out_set(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.set_output)
     await cq.message.edit_text(
         "📤 *Задать output-чат*\n\n"
-        "Введи @username или числовой ID чата:",
+        "• Введи @username или числовой ID чата\n"
+        "• Или перешли любое сообщение из нужного канала\n\n"
+        "_Бот должен быть админом канала с правом писать сообщения._",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
     )
@@ -856,9 +853,27 @@ async def fsm_set_output(message: Message, state: FSMContext, bot: Bot) -> None:
         return
     assert db is not None
 
+    # ── forwarded message from a channel ─────────────────────────────────────
+    if message.forward_from_chat:
+        chat_id = message.forward_from_chat.id
+        label = (
+            f"@{message.forward_from_chat.username}"
+            if message.forward_from_chat.username
+            else message.forward_from_chat.title
+        )
+        await db.set_setting("output_chat_id", str(chat_id))
+        await state.clear()
+        await message.answer(
+            f"✅ Output-чат: *{label}* (`{chat_id}`)\n\n"
+            "_Убедись, что бот добавлен админом в этот канал._",
+            parse_mode="Markdown",
+            reply_markup=kb_back(),
+        )
+        return
+
     raw = (message.text or "").strip()
     if not raw:
-        await message.answer("Введи @username или числовой ID.", reply_markup=kb_cancel())
+        await message.answer("Введи @username, числовой ID или перешли сообщение из канала.", reply_markup=kb_cancel())
         return
 
     identifier = raw.lstrip("@")
