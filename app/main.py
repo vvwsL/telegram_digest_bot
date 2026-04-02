@@ -45,6 +45,7 @@ class S(StatesGroup):
     add_keyword         = State()
     add_schedule        = State()
     set_output          = State()
+    edit_folder_prompt  = State()     # data: folder_id
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -128,7 +129,6 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
         if keywords and any(kw in m.text.casefold() for kw in keywords)
     } if keywords else set()
 
-    selected = messages[: cfg.max_items]
     items = [
         DigestItem(
             snippet=m.snippet,
@@ -136,7 +136,7 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
             link=m.link,
             important=m.id in important_ids,
         )
-        for m in selected
+        for m in messages
     ]
 
     start_dt = (
@@ -144,7 +144,7 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
         if since_ts
         else now.replace(hour=0, minute=0, second=0, microsecond=0)
     )
-    result = await summarizer.summarize(folder.name, start_dt, now, items)
+    result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
@@ -153,7 +153,7 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     await db.set_setting(last_key, str(now_ts))
 
-    return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
 
 
 async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> str:
@@ -199,7 +199,6 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
         if keywords and any(kw in m.text.casefold() for kw in keywords)
     } if keywords else set()
 
-    selected = messages[: cfg.max_items * 3]  # bigger limit for one-off
     items = [
         DigestItem(
             snippet=m.snippet,
@@ -207,18 +206,18 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> 
             link=m.link,
             important=m.id in important_ids,
         )
-        for m in selected
+        for m in messages
     ]
 
     start_dt = datetime.fromtimestamp(since_ts, tz=tz)
-    result = await summarizer.summarize(folder.name, start_dt, now, items)
+    result = await summarizer.summarize(folder.name, start_dt, now, items, custom_prompt=folder.prompt)
 
     if not result.text:
         return "⚠️ LLM вернул пустой ответ."
 
     await bot.send_message(int(output_raw), result.text, parse_mode="Markdown", reply_markup=kb_back())
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
-    return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+    return f"✅ {len(messages)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
 
 
 async def _run_all_digests(bot: Bot) -> str:
@@ -598,6 +597,88 @@ async def cb_ch_del(cq: CallbackQuery) -> None:
             await _show_folder(cq, folder)
             return
     await _show_folders(cq)
+
+
+# ─── Callbacks: folder prompt ─────────────────────────────────────────────────
+
+@router.callback_query(F.data.startswith("fold:prompt:"))
+async def cb_fold_prompt(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+    folder_id = int(cq.data.split(":")[2])
+    folder = await db.get_folder(folder_id)
+    if not folder:
+        await cq.answer("Папка не найдена.", show_alert=True)
+        return
+    await cq.answer()
+
+    from .summarizer import Summarizer
+    current = folder.prompt or Summarizer.DEFAULT_SYSTEM
+    text = (
+        f"<b>📝 Промт для «{_html.escape(folder.name)}»</b>\n\n"
+        f"<code>{_html.escape(current)}</code>"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить", callback_data=f"fold:prompt_edit:{folder_id}")],
+        [InlineKeyboardButton(text="🔄 Сбросить по умолчанию", callback_data=f"fold:prompt_reset:{folder_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"fold:view:{folder_id}")],
+    ])
+    await cq.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("fold:prompt_edit:"))
+async def cb_fold_prompt_edit(cq: CallbackQuery, state: FSMContext) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    folder_id = int(cq.data.split(":")[2])
+    await cq.answer()
+    await state.set_state(S.edit_folder_prompt)
+    await state.update_data(folder_id=folder_id)
+    await cq.message.edit_text(
+        "📝 *Введи новый промт для LLM*\n\n"
+        "Это системная инструкция, которая определяет формат и стиль дайджеста.",
+        parse_mode="Markdown",
+        reply_markup=kb_cancel(),
+    )
+
+
+@router.message(S.edit_folder_prompt)
+async def fsm_edit_folder_prompt(message: Message, state: FSMContext) -> None:
+    if not _is_admin(message.from_user.id):
+        return
+    assert db is not None
+
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Введи текст промта.", reply_markup=kb_cancel())
+        return
+
+    data = await state.get_data()
+    folder_id: int = data.get("folder_id", -1)
+    await db.set_folder_prompt(folder_id, text)
+    await state.clear()
+    await message.answer(
+        "✅ Промт обновлён!",
+        reply_markup=kb_back_to_folder(folder_id),
+    )
+
+
+@router.callback_query(F.data.startswith("fold:prompt_reset:"))
+async def cb_fold_prompt_reset(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+    folder_id = int(cq.data.split(":")[2])
+    await db.set_folder_prompt(folder_id, None)
+    await cq.answer("✅ Промт сброшен")
+
+    folder = await db.get_folder(folder_id)
+    if folder:
+        await _show_folder(cq, folder)
 
 
 # ─── Callbacks: keywords ──────────────────────────────────────────────────────

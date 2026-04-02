@@ -41,6 +41,7 @@ def kb_folder(folder: Folder, channels: list[Channel]) -> InlineKeyboardMarkup:
             _btn("🗑️", f"ch:del:{ch.id}"),
         )
     b.row(_btn("➕ Добавить канал", f"ch:add_in:{folder.id}"))
+    b.row(_btn("📝 Промт LLM", f"fold:prompt:{folder.id}"))
     b.row(_btn("🚀 Дайджест папки сейчас", f"fold:digest:{folder.id}"))
     b.row(_btn("🔙 К папкам", "fold:list"))
     return b.as_markup()

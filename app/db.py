@@ -10,6 +10,7 @@ import aiosqlite
 class Folder:
     id: int
     name: str
+    prompt: str | None = None
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ class Database:
         # migrations for existing databases
         for migration in (
             "ALTER TABLE channels ADD COLUMN folder_id INTEGER REFERENCES folders(id) ON DELETE SET NULL",
+            "ALTER TABLE folders ADD COLUMN prompt TEXT",
         ):
             try:
                 async with self._lock:
@@ -154,12 +156,15 @@ class Database:
         return cur.rowcount > 0
 
     async def list_folders(self) -> list[Folder]:
-        rows = await self._fetchall("SELECT id, name FROM folders ORDER BY name")
-        return [Folder(id=r["id"], name=r["name"]) for r in rows]
+        rows = await self._fetchall("SELECT id, name, prompt FROM folders ORDER BY name")
+        return [Folder(id=r["id"], name=r["name"], prompt=r["prompt"]) for r in rows]
 
     async def get_folder(self, folder_id: int) -> Folder | None:
-        row = await self._fetchone("SELECT id, name FROM folders WHERE id = ?", (folder_id,))
-        return Folder(id=row["id"], name=row["name"]) if row else None
+        row = await self._fetchone("SELECT id, name, prompt FROM folders WHERE id = ?", (folder_id,))
+        return Folder(id=row["id"], name=row["name"], prompt=row["prompt"]) if row else None
+
+    async def set_folder_prompt(self, folder_id: int, prompt: str | None) -> None:
+        await self._execute("UPDATE folders SET prompt = ? WHERE id = ?", (prompt, folder_id))
 
     async def count_channels_in_folder(self, folder_id: int) -> int:
         row = await self._fetchone(
