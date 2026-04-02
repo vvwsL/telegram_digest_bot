@@ -261,17 +261,21 @@ async def _show_folder(target: Message | CallbackQuery, folder: Folder) -> None:
             f"• @{ch.username}" if ch.username else f"• {ch.title or ch.chat_id}"
             for ch in channels
         )
-        text = f"📁 *{folder.name}*\n\n{lines}\n\n_Посты забираются автоматически через t.me/s/_"
+        text = (
+            f"<b>📁 {folder.name}</b>\n\n"
+            f"{lines}\n\n"
+            f"<i>Посты забираются автоматически через t.me/s/</i>"
+        )
     else:
-        text = f"📁 *{folder.name}*\n\n_Каналов нет. Добавь первый!_"
+        text = f"<b>📁 {folder.name}</b>\n\n<i>Каналов нет. Добавь первый!</i>"
 
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(
-            text, parse_mode="Markdown", reply_markup=kb_folder(folder, channels)
+            text, parse_mode="HTML", reply_markup=kb_folder(folder, channels)
         )
     else:
         await target.answer(
-            text, parse_mode="Markdown", reply_markup=kb_folder(folder, channels)
+            text, parse_mode="HTML", reply_markup=kb_folder(folder, channels)
         )
 
 
