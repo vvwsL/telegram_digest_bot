@@ -184,8 +184,16 @@ class Database:
                 await self._execute(
                     "UPDATE channels SET folder_id = ? WHERE id = ?", (folder_id, row["id"])
                 )
+                # reset digest timestamp so new channel posts are included
+                await self._execute(
+                    "DELETE FROM settings WHERE key = ?", (f"last_digest_ts:{folder_id}",)
+                )
                 return row["id"], False
             return -1, False
+        # reset digest timestamp so new channel posts are included
+        await self._execute(
+            "DELETE FROM settings WHERE key = ?", (f"last_digest_ts:{folder_id}",)
+        )
         return cur.lastrowid, True
 
     async def remove_channel(self, channel_id: int) -> bool:
