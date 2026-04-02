@@ -432,12 +432,27 @@ async def cb_ch_add_in(cq: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(S.add_channel_in_folder)
     await state.update_data(folder_id=folder_id)
     await cq.message.edit_text(
-        "🌐 *Добавить канал*\n\n"
-        "Введи @username публичного канала.\n\n"
+        "🌐 *Добавить каналы*\n\n"
+        "• Отправь @username (один или список)\n"
+        "• Или перешли пост из публичного канала\n\n"
         "_Посты забираются через t.me/s/ — добавлять бота в канал не нужно._",
         parse_mode="Markdown",
         reply_markup=kb_cancel(),
     )
+
+
+async def _add_single_channel(username: str, folder_id: int) -> str:
+    """Try to add one channel, return status line."""
+    assert db is not None
+    try:
+        posts = await fetch_channel_posts(username, limit=1)
+    except Exception as exc:
+        return f"❌ @{username} — {exc}"
+
+    channel_id, created = await db.add_scraper_channel(username, folder_id=folder_id)
+    if created:
+        return f"✅ @{username} добавлен"
+    return f"ℹ️ @{username} уже есть"
 
 
 @router.message(S.add_channel_in_folder)
@@ -449,41 +464,43 @@ async def fsm_add_channel_in_folder(message: Message, state: FSMContext) -> None
     data = await state.get_data()
     folder_id: int = data.get("folder_id", -1)
 
-    raw = (message.text or "").strip().lstrip("@")
-    if not raw or not re.match(r"^[a-zA-Z0-9_]{3,}$", raw):
+    # ── forwarded post from a channel ────────────────────────────────────────
+    if message.forward_from_chat and message.forward_from_chat.username:
+        username = message.forward_from_chat.username
+        await message.answer("⏳ Проверяю канал...")
+        result = await _add_single_channel(username, folder_id)
+        await state.clear()
+        await message.answer(result, parse_mode="Markdown", reply_markup=kb_back_to_folder(folder_id))
+        return
+
+    # ── parse usernames from text ────────────────────────────────────────────
+    text = message.text or ""
+    usernames = re.findall(r"@?([a-zA-Z0-9_]{3,})", text)
+
+    if not usernames:
         await message.answer(
-            "Введи корректный @username (только латиница, цифры, _).",
+            "Введи @username, список или перешли пост из канала.",
             reply_markup=kb_cancel(),
         )
         return
 
-    await message.answer("⏳ Проверяю канал...")
-    try:
-        posts = await fetch_channel_posts(raw, limit=1)
-    except Exception as exc:
+    # single channel — quick path
+    if len(usernames) == 1:
+        await message.answer("⏳ Проверяю канал...")
+        result = await _add_single_channel(usernames[0], folder_id)
         await state.clear()
-        await message.answer(
-            f"❌ Не удалось получить посты: {exc}\n\n"
-            "Убедись, что канал публичный и правильно написан @username.",
-            reply_markup=kb_back_to_folder(folder_id),
-        )
+        await message.answer(result, parse_mode="Markdown", reply_markup=kb_back_to_folder(folder_id))
         return
 
-    channel_id, created = await db.add_scraper_channel(raw, folder_id=folder_id)
+    # bulk add
+    await message.answer(f"⏳ Добавляю {len(usernames)} каналов...")
+    results = []
+    for uname in usernames:
+        results.append(await _add_single_channel(uname, folder_id))
+
     await state.clear()
-
-    posts_hint = f" (найдено {len(posts)} постов)" if posts else ""
-    if not created:
-        await message.answer(
-            f"ℹ️ Канал *@{raw}* уже добавлен (перемещён в эту папку){posts_hint}.",
-            parse_mode="Markdown",
-            reply_markup=kb_back_to_folder(folder_id),
-        )
-        return
-
     await message.answer(
-        f"✅ Канал *@{raw}* добавлен{posts_hint}.\n\n"
-        "_Посты будут забираться автоматически каждые 15 минут._",
+        "\n".join(results),
         parse_mode="Markdown",
         reply_markup=kb_back_to_folder(folder_id),
     )
