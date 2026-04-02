@@ -22,7 +22,7 @@ from .keyboards import (
     kb_main, kb_folders, kb_folder,
     kb_keywords, kb_schedule, kb_output, kb_digest_period,
     kb_cancel, kb_back, kb_back_to_folders, kb_back_to_folder,
-    kb_folder_prompt,
+    kb_folder_prompt, kb_stop_digest,
 )
 
 
@@ -34,6 +34,7 @@ summarizer: Summarizer | None = None
 tz: ZoneInfo | None = None
 digest_lock = asyncio.Lock()
 _fired_slots: set[str] = set()
+_digest_cancel = asyncio.Event()
 
 router = Router()
 
@@ -96,13 +97,15 @@ async def _run_folder_digest(bot: Bot, folder: Folder, progress_msg: Message | N
     # always scrape fresh posts before building a digest
     scrape_errors: list[str] = []
     for ch in channels:
+        if _digest_cancel.is_set():
+            return "⛔ Остановлено."
         if not ch.username:
             continue
         if progress_msg:
             try:
                 await progress_msg.edit_text(
                     f"⏳ *{folder.name}*: скрапинг @{ch.username}...",
-                    parse_mode="Markdown", reply_markup=None,
+                    parse_mode="Markdown", reply_markup=kb_stop_digest(),
                 )
             except Exception:
                 pass
@@ -204,13 +207,15 @@ async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int, pro
 
     scrape_errors: list[str] = []
     for ch in channels:
+        if _digest_cancel.is_set():
+            return "⛔ Остановлено."
         if not ch.username:
             continue
         if progress_msg:
             try:
                 await progress_msg.edit_text(
                     f"⏳ *{folder.name}*: скрапинг @{ch.username}...",
-                    parse_mode="Markdown", reply_markup=None,
+                    parse_mode="Markdown", reply_markup=kb_stop_digest(),
                 )
             except Exception:
                 pass
@@ -289,12 +294,15 @@ async def _run_all_digests(bot: Bot, progress_msg: Message | None = None) -> str
     total = len(folders)
     lines = []
     for i, folder in enumerate(folders, start=1):
+        if _digest_cancel.is_set():
+            lines.append("⛔ Остановлено пользователем.")
+            break
         if progress_msg:
             try:
                 await progress_msg.edit_text(
                     f"⏳ [{i}/{total}] Обрабатываю *{folder.name}*...",
                     parse_mode="Markdown",
-                    reply_markup=None,
+                    reply_markup=kb_stop_digest(),
                 )
             except Exception:
                 pass
@@ -542,14 +550,16 @@ async def cb_fold_digest(cq: CallbackQuery, bot: Bot) -> None:
         await cq.answer("Папка не найдена.", show_alert=True)
         return
 
+    _digest_cancel.clear()
     await cq.answer("⏳ Запускаю...")
     await cq.message.edit_text(
         f"⏳ Генерирую дайджест папки *{folder.name}*...",
         parse_mode="Markdown",
-        reply_markup=None,
+        reply_markup=kb_stop_digest(),
     )
     async with digest_lock:
         result = await _run_folder_digest(bot, folder, progress_msg=cq.message)
+    _digest_cancel.clear()
 
     await cq.message.edit_text(
         f"*{folder.name}*\n\n{result}",
@@ -946,9 +956,41 @@ async def fsm_set_output(message: Message, state: FSMContext, bot: Bot) -> None:
 
     identifier = raw.lstrip("@")
     if identifier.lstrip("-").isdigit():
-        await db.set_setting("output_chat_id", raw if raw.startswith("-") else identifier)
+        chat_id = raw if raw.startswith("-") else identifier
+        # validate by trying to reach the chat
+        try:
+            chat_obj = await bot.get_chat(int(chat_id))
+        except Exception:
+            # maybe missing -100 prefix for a private channel
+            if not chat_id.startswith("-100"):
+                alt = f"-100{chat_id.lstrip('-')}"
+                try:
+                    chat_obj = await bot.get_chat(int(alt))
+                    chat_id = alt
+                except Exception:
+                    await message.answer(
+                        f"❌ Чат `{raw}` не найден.\n"
+                        f"Пробовал также `{alt}`.\n\n"
+                        "Убедись, что бот добавлен админом в канал.\n"
+                        "Или перешли сообщение из канала — это надёжнее.",
+                        parse_mode="Markdown", reply_markup=kb_cancel(),
+                    )
+                    return
+            else:
+                await message.answer(
+                    f"❌ Чат `{raw}` не найден.\n\n"
+                    "Убедись, что бот добавлен админом в канал.\n"
+                    "Или перешли сообщение из канала — это надёжнее.",
+                    parse_mode="Markdown", reply_markup=kb_cancel(),
+                )
+                return
+        label = f"@{chat_obj.username}" if chat_obj.username else chat_obj.title
+        await db.set_setting("output_chat_id", chat_id)
         await state.clear()
-        await message.answer(f"✅ Output-чат: `{raw}`", parse_mode="Markdown", reply_markup=kb_back())
+        await message.answer(
+            f"✅ Output-чат: *{label}* (`{chat_id}`)",
+            parse_mode="Markdown", reply_markup=kb_back(),
+        )
         return
 
     try:
@@ -965,15 +1007,26 @@ async def fsm_set_output(message: Message, state: FSMContext, bot: Bot) -> None:
 
 # ─── Callbacks: digest & status ───────────────────────────────────────────────
 
+@router.callback_query(F.data == "digest:stop")
+async def cb_digest_stop(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    _digest_cancel.set()
+    await cq.answer("⛔ Останавливаю после текущей папки...")
+
+
 @router.callback_query(F.data == "digest:now")
 async def cb_digest_now(cq: CallbackQuery, bot: Bot) -> None:
     if not _is_admin(cq.from_user.id):
         await cq.answer()
         return
+    _digest_cancel.clear()
     await cq.answer("⏳ Запускаю...")
-    await cq.message.edit_text("⏳ Генерирую дайджесты всех папок...", reply_markup=None)
+    await cq.message.edit_text("⏳ Генерирую дайджесты всех папок...", reply_markup=kb_stop_digest())
     async with digest_lock:
         result = await _run_all_digests(bot, progress_msg=cq.message)
+    _digest_cancel.clear()
     await cq.message.edit_text(result, parse_mode="Markdown", reply_markup=kb_back())
 
 
@@ -1000,10 +1053,11 @@ async def cb_oneoff_period(cq: CallbackQuery, bot: Bot) -> None:
     days_str = cq.data.split(":")[1].rstrip("d")
     days = int(days_str)
 
+    _digest_cancel.clear()
     await cq.answer("⏳ Запускаю...")
     await cq.message.edit_text(
         f"⏳ Генерирую разовый дайджест за {days} дн. для всех папок...",
-        reply_markup=None,
+        reply_markup=kb_stop_digest(),
     )
 
     folders = await db.list_folders()
@@ -1015,14 +1069,18 @@ async def cb_oneoff_period(cq: CallbackQuery, bot: Bot) -> None:
     lines = []
     async with digest_lock:
         for i, folder in enumerate(folders, start=1):
+            if _digest_cancel.is_set():
+                lines.append("⛔ Остановлено пользователем.")
+                break
             await cq.message.edit_text(
                 f"⏳ [{i}/{total}] Обрабатываю *{folder.name}*...",
                 parse_mode="Markdown",
-                reply_markup=None,
+                reply_markup=kb_stop_digest(),
             )
             result = await _run_folder_digest_for_period(bot, folder, days, progress_msg=cq.message)
             lines.append(f"*{folder.name}*: {result}")
 
+    _digest_cancel.clear()
     await cq.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
 
 

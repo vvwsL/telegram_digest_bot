@@ -93,6 +93,12 @@ def kb_cancel() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def kb_stop_digest() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(_btn("⛔ Остановить", "digest:stop"))
+    return b.as_markup()
+
+
 def kb_back() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(_btn("🔙 Главное меню", "main:menu"))
