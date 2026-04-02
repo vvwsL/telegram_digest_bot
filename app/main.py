@@ -20,7 +20,7 @@ from .scraper import fetch_channel_posts
 from .summarizer import Summarizer, DigestItem
 from .keyboards import (
     kb_main, kb_folders, kb_folder,
-    kb_keywords, kb_schedule, kb_output,
+    kb_keywords, kb_schedule, kb_output, kb_digest_period,
     kb_cancel, kb_back, kb_back_to_folders, kb_back_to_folder,
 )
 
@@ -153,6 +153,71 @@ async def _run_folder_digest(bot: Bot, folder: Folder) -> str:
     await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     await db.set_setting(last_key, str(now_ts))
 
+    return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
+
+
+async def _run_folder_digest_for_period(bot: Bot, folder: Folder, days: int) -> str:
+    """One-off digest: scrape + summarize last N days, don't update last_digest_ts."""
+    assert db is not None and cfg is not None and summarizer is not None and tz is not None
+
+    output_raw = await db.get_setting("output_chat_id")
+    if not output_raw:
+        return "❌ Не задан output-чат."
+
+    channels = await db.list_channels_in_folder(folder.id)
+    if not channels:
+        return "⚪ Нет каналов."
+
+    now = datetime.now(tz)
+    now_ts = int(now.astimezone(timezone.utc).timestamp())
+    since_ts = now_ts - days * 86400
+
+    for ch in channels:
+        if not ch.username:
+            continue
+        try:
+            posts = await fetch_channel_posts(ch.username, limit=20)
+        except Exception:
+            continue
+        for post in posts:
+            snippet = _snippet(post.text, cfg.snippet_chars)
+            msg_hash = _make_hash(post.text)
+            await db.add_message(
+                channel_id=ch.id, chat_id=ch.chat_id,
+                message_id=post.message_id, ts=post.ts,
+                text=post.text, snippet=snippet,
+                link=post.link, msg_hash=msg_hash,
+            )
+
+    messages = await db.fetch_messages_since_by_folder(folder.id, since_ts, now_ts)
+    if not messages:
+        return "ℹ️ Нет сообщений за этот период."
+
+    keywords = [kw.casefold() for _, kw in await db.list_keywords()]
+    important_ids = {
+        m.id for m in messages
+        if keywords and any(kw in m.text.casefold() for kw in keywords)
+    } if keywords else set()
+
+    selected = messages[: cfg.max_items * 3]  # bigger limit for one-off
+    items = [
+        DigestItem(
+            snippet=m.snippet,
+            source=f"@{m.channel_username}" if m.channel_username else (m.channel_title or str(m.chat_id)),
+            link=m.link,
+            important=m.id in important_ids,
+        )
+        for m in selected
+    ]
+
+    start_dt = datetime.fromtimestamp(since_ts, tz=tz)
+    result = await summarizer.summarize(folder.name, start_dt, now, items)
+
+    if not result.text:
+        return "⚠️ LLM вернул пустой ответ."
+
+    await bot.send_message(int(output_raw), result.text, parse_mode="Markdown")
+    await db.create_digest(now_ts, "sent", result.tokens_in, result.tokens_out)
     return f"✅ {len(selected)} постов. Токены: {result.tokens_in}/{result.tokens_out}"
 
 
@@ -746,6 +811,49 @@ async def cb_digest_now(cq: CallbackQuery, bot: Bot) -> None:
     async with digest_lock:
         result = await _run_all_digests(bot)
     await cq.message.edit_text(result, parse_mode="Markdown", reply_markup=kb_back())
+
+
+@router.callback_query(F.data == "digest:oneoff")
+async def cb_digest_oneoff(cq: CallbackQuery) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    await cq.answer()
+    await cq.message.edit_text(
+        "📅 *Разовый дайджест*\n\nВыбери период для всех папок:",
+        parse_mode="Markdown",
+        reply_markup=kb_digest_period(),
+    )
+
+
+@router.callback_query(F.data.startswith("oneoff:"))
+async def cb_oneoff_period(cq: CallbackQuery, bot: Bot) -> None:
+    if not _is_admin(cq.from_user.id):
+        await cq.answer()
+        return
+    assert db is not None
+
+    days_str = cq.data.split(":")[1].rstrip("d")
+    days = int(days_str)
+
+    await cq.answer("⏳ Запускаю...")
+    await cq.message.edit_text(
+        f"⏳ Генерирую разовый дайджест за {days} дн. для всех папок...",
+        reply_markup=None,
+    )
+
+    folders = await db.list_folders()
+    if not folders:
+        await cq.message.edit_text("❌ Нет папок.", reply_markup=kb_back())
+        return
+
+    lines = []
+    async with digest_lock:
+        for folder in folders:
+            result = await _run_folder_digest_for_period(bot, folder, days)
+            lines.append(f"*{folder.name}*: {result}")
+
+    await cq.message.edit_text("\n".join(lines), parse_mode="Markdown", reply_markup=kb_back())
 
 
 @router.callback_query(F.data == "status:show")

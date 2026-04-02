@@ -14,7 +14,7 @@ def kb_main() -> InlineKeyboardMarkup:
     b = InlineKeyboardBuilder()
     b.row(_btn("📁 Папки", "fold:list"), _btn("🔑 Ключевые слова", "kw:list"))
     b.row(_btn("⏰ Расписание", "sch:list"), _btn("📤 Куда слать", "out:show"))
-    b.row(_btn("🚀 Дайджест всех папок сейчас", "digest:now"))
+    b.row(_btn("🚀 Дайджест сейчас", "digest:now"), _btn("📅 Разовый", "digest:oneoff"))
     b.row(_btn("📊 Статус", "status:show"))
     return b.as_markup()
 
@@ -66,6 +66,15 @@ def kb_schedule(times: list[tuple[int, str]]) -> InlineKeyboardMarkup:
             _btn("🗑️", f"sch:del:{sch_id}"),
         )
     b.row(_btn("➕ Добавить время", "sch:add"))
+    b.row(_btn("🔙 Главное меню", "main:menu"))
+    return b.as_markup()
+
+
+def kb_digest_period() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.row(_btn("📅 1 день", "oneoff:1d"), _btn("📅 3 дня", "oneoff:3d"))
+    b.row(_btn("📅 1 неделя", "oneoff:7d"), _btn("📅 2 недели", "oneoff:14d"))
+    b.row(_btn("📅 1 месяц", "oneoff:30d"), _btn("📅 2 месяца", "oneoff:60d"))
     b.row(_btn("🔙 Главное меню", "main:menu"))
     return b.as_markup()
 
