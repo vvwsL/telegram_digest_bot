@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html as _html
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -258,16 +259,16 @@ async def _show_folder(target: Message | CallbackQuery, folder: Folder) -> None:
 
     if channels:
         lines = "\n".join(
-            f"• @{ch.username}" if ch.username else f"• {ch.title or ch.chat_id}"
+            f"• @{ch.username}" if ch.username else f"• {_html.escape(ch.title or str(ch.chat_id))}"
             for ch in channels
         )
         text = (
-            f"<b>📁 {folder.name}</b>\n\n"
+            f"<b>📁 {_html.escape(folder.name)}</b>\n\n"
             f"{lines}\n\n"
             f"<i>Посты забираются автоматически через t.me/s/</i>"
         )
     else:
-        text = f"<b>📁 {folder.name}</b>\n\n<i>Каналов нет. Добавь первый!</i>"
+        text = f"<b>📁 {_html.escape(folder.name)}</b>\n\n<i>Каналов нет. Добавь первый!</i>"
 
     if isinstance(target, CallbackQuery):
         await target.message.edit_text(
